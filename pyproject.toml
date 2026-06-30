@@ -1,0 +1,9 @@
+# Minimal project metadata file. Currently used only to configure pytest;
+# packaging metadata (name/version/dependencies) can be added later if we
+# decide to publish this as an installable package.
+
+[tool.pytest.ini_options]
+# Make `from models.dit import ...` work in test files by prepending the
+# project root to sys.path during test collection.
+pythonpath = ["."]
+testpaths = ["tests"]
