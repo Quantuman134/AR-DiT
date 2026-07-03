@@ -52,8 +52,16 @@ wandb/
 outputs/
 samples/
 results/
-data/
+# `data/` holds both a source Python package (dataset adapters) AND the
+# downloaded CIFAR-10 cache. Ignore everything under it by default, then
+# whitelist the tracked source files.
+data/*
+!data/*.py
+!data/**/*.py
 datasets/
+
+# --- Secrets (wandb token, API keys, etc.) ---
+secrets/
 
 # --- Reference papers / large binaries (keep out of repo) ---
 *.pdf

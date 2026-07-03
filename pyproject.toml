@@ -1,9 +1,85 @@
-# Minimal project metadata file. Currently used only to configure pytest;
-# packaging metadata (name/version/dependencies) can be added later if we
-# decide to publish this as an installable package.
+# -----------------------------------------------------------------------------
+# Project manifest for Attention_Residual_for_DiT
+# -----------------------------------------------------------------------------
+# Version pins below match the working `dit` conda environment (torch 2.6.0 +
+# cu124, torchvision 0.21.0 + cu124, torchmetrics 1.9.0, ...).  The CUDA
+# suffixes ("+cu124") are intentionally *not* baked into the pins — those
+# builds live on the PyTorch wheel index, not PyPI, and hard-coding the suffix
+# would break CPU-only reinstalls and non-cu124 GPUs.
+#
+# Recommended install (GPU box, cu124):
+#   pip install --index-url https://download.pytorch.org/whl/cu124 \
+#               torch==2.6.0 torchvision==0.21.0
+#   pip install -e ".[dev]"
+#
+# Recommended install (CPU-only box):
+#   pip install --index-url https://download.pytorch.org/whl/cpu \
+#               torch==2.6.0 torchvision==0.21.0
+#   pip install -e ".[dev]"
+# -----------------------------------------------------------------------------
+
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "attention-residual-for-dit"
+version         = "0.1.0"
+description     = "Diffusion Transformer with attention-residual connections, trained via flow matching on CIFAR-10."
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = { text = "MIT" }
+
+dependencies = [
+    # --- deep-learning core (versions in the working `dit` env) --------------
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+
+    # --- evaluation stack (FID / IS wrappers in eval/*) ----------------------
+    "torchmetrics>=1.9,<2.0",
+    "torch-fidelity>=0.4",   # cross-validation FID reference (see doc/Test.md)
+    "scipy>=1.11",           # matrix-sqrt inside torchmetrics FID
+    "numpy>=1.26",
+
+    # --- dataset / fixture I/O -----------------------------------------------
+    "Pillow>=10.0",
+
+    # --- config loading (used from Phase C onward) ---------------------------
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+
+[tool.setuptools]
+# Real Python packages we want installed.  The remaining top-level
+# directories (`doc/`, `scripts/`, `tests/`, ...) are either
+# documentation, entry points, or test data, and must not be packaged.
+# `configs/` is unusual: it holds YAML files *and* one Python module
+# (`configs/schema.py`), so it must be listed here.
+packages = ["flow", "eval", "data", "models", "configs"]
+
+[tool.setuptools.package-data]
+# Ship the YAML files alongside `configs/schema.py` when someone
+# installs the project into a site-packages location.
+configs = ["**/*.yaml"]
 
 [tool.pytest.ini_options]
-# Make `from models.dit import ...` work in test files by prepending the
-# project root to sys.path during test collection.
+# Prepend the project root to sys.path during test collection so that
+# `from models.dit import ...`, `from flow.interpolant import ...`, etc.
+# resolve without requiring an editable install.  Once `pip install -e .`
+# has been run this line is redundant but harmless — we keep it so `pytest`
+# also works in a freshly cloned checkout that has *not* been installed.
 pythonpath = ["."]
-testpaths = ["tests"]
+testpaths  = ["tests"]
+# Skip slow tests (currently: Layer 4 overfit-one-batch, see doc/Test.md)
+# by default so `pytest tests/ -q` stays fast for pre-commit / CI-lite.
+# Run explicitly with `pytest tests/ -q -m slow` (or `-m 'slow or not slow'`
+# for the full suite).
+addopts = "-m 'not slow'"
+markers = [
+    "slow: expensive tests skipped by default (see doc/Test.md Layer 4).",
+]
