@@ -35,6 +35,7 @@ Attention_Residual_for_DiT/
 ├── doc/
 │   ├── Plan.md                # this file
 │   ├── DiT.md                 # baseline DiT design spec
+│   ├── AR_DiT.md              # AR-DiT design spec (attention residual)
 │   ├── FlowMatching.md        # math: interpolant, loss, CFG, EMA, sampler
 │   ├── Train.md               # runtime: configs, DDP, wandb, checkpoints
 │   └── Test.md                # test strategy
