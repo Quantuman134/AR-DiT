@@ -14,6 +14,13 @@ from .dit import (
     DiT_L_2,
     DiT_XL_2,
 )
+from .ar_dit import (
+    ARDiT,
+    ARDiT_S_2,
+    ARDiT_B_2,
+    ARDiT_L_2,
+    ARDiT_XL_2,
+)
 
 # ---------------------------------------------------------------------------
 # Arch registry + config-driven factory
@@ -24,10 +31,14 @@ from .dit import (
 # renamed field) has exactly one place to update.
 
 _ARCH_PRESETS = {
-    "DiT_S_2":  DiT_S_2,
-    "DiT_B_2":  DiT_B_2,
-    "DiT_L_2":  DiT_L_2,
-    "DiT_XL_2": DiT_XL_2,
+    "DiT_S_2":    DiT_S_2,
+    "DiT_B_2":    DiT_B_2,
+    "DiT_L_2":    DiT_L_2,
+    "DiT_XL_2":   DiT_XL_2,
+    "ARDiT_S_2":  ARDiT_S_2,
+    "ARDiT_B_2":  ARDiT_B_2,
+    "ARDiT_L_2":  ARDiT_L_2,
+    "ARDiT_XL_2": ARDiT_XL_2,
 }
 
 
@@ -59,5 +70,10 @@ __all__ = [
     "DiT_B_2",
     "DiT_L_2",
     "DiT_XL_2",
+    "ARDiT",
+    "ARDiT_S_2",
+    "ARDiT_B_2",
+    "ARDiT_L_2",
+    "ARDiT_XL_2",
     "build_model_from_config",
 ]
