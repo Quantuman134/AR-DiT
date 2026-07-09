@@ -1,0 +1,95 @@
+# ----------------------------------------------------------------------
+# Training config — AR-DiT-S/2 on CIFAR-10, flow-matching loss.
+#
+# This is the drop-in AR-DiT counterpart of ``cifar10_train.yaml``.
+# Only two fields differ from the baseline DiT training config:
+#
+#   * ``model_config`` → points at ``ar_dit_s2_cifar.yaml``.
+#   * ``logging.run_name`` → distinct output dir so runs never collide.
+#
+# Everything else (optimiser, LR schedule, batch size, EMA decays,
+# validation cadence, guidance scales, seed, AMP dtype, ...) is
+# byte-identical to the baseline. That is intentional: the AR-DiT
+# vs. DiT comparison is architecture-only, so all *non*-architectural
+# knobs must be held fixed for the two runs to be a fair pair.
+#
+# Fields and semantics are documented in doc/Train.md §2.3.
+# Math (loss, CFG, EMA, sampler) is documented in doc/FlowMatching.md.
+# Override any field at the CLI:  --override optim.lr=2.0e-4
+# ----------------------------------------------------------------------
+
+# Architecture is defined in a separate file. The relative path is
+# resolved against this YAML's directory.
+model_config: ../model/ar_dit_s2_cifar.yaml
+
+# ---- Dataset ----
+# `root` is intentionally an absolute path so the same config + same
+# launcher work on a new machine by editing exactly this line (or by
+# passing --dataset_root on the command line; the CLI wins).
+dataset:
+  name: cifar10
+  root: /data/cifar10
+  download: false           # never download silently; if missing, fail loudly
+  num_workers: 4
+  pin_memory: true
+  augment: true             # RandomHorizontalFlip(p=0.5); off for validation loader
+
+# ---- Optimiser & schedule ----
+optim:
+  name: adamw
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+  grad_clip: 1.0            # null = disabled
+  warmup_steps: 1000
+  lr_schedule: constant     # one of: constant, cosine
+
+# ---- Training loop ----
+train:
+  total_steps: 400000
+  batch_size_per_gpu: 128
+  grad_accum_steps: 1
+  log_interval: 50          # steps between terminal/wandb scalar logs
+  ckpt_interval: 10000      # steps between checkpoints
+  seed: 0
+  amp_dtype: bf16           # one of: fp32, bf16
+
+# ---- EMA (one shadow copy per decay value) ----
+# See doc/FlowMatching.md §5.
+ema:
+  decays: [0.9999, 0.999]
+
+# ---- Classifier-free guidance ----
+# class_dropout_prob lives in the model config because it is owned by
+# LabelEmbedder. The null-class id is always num_classes (= last embedding
+# row), and is not a free parameter — kept here only for documentation.
+guidance:
+  null_class_id: 10         # = num_classes (CIFAR-10)
+
+# ---- Validation (rank-0 only) ----
+# See doc/Train.md §7.
+validation:
+  interval: 10000           # steps between validation passes
+  num_samples: 32           # generated images per (ema, guidance-scale) pair
+  batch_size_per_gpu: 128   # per-chunk generation size; bounds validation VRAM
+                            # independent of num_samples. FID/IS compute() is
+                            # mathematically identical to a single-shot call.
+  visual_log_count: 16      # how many of those to log to wandb as a grid
+  guidance_scales: [1.0, 1.5, 4.0]
+  metrics:
+    fid: true
+    inception_score: true
+  fid_ref_stats: /data/cifar10/fid_ref_stats.npz   # null = compute on first run
+  sampler:
+    num_steps: 50           # Euler steps used during validation
+
+# ---- Logging / I/O ----
+logging:
+  out_dir: runs/
+  run_name: ar_dit_s2_cifar # final dir = runs/ar_dit_s2_cifar/
+  wandb:
+    enabled: true
+    project: attn_residual_dit
+    entity: null            # null = personal account
+    token_path: secrets/wandb.token
+    mode: online            # online | offline | disabled

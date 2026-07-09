@@ -1,0 +1,54 @@
+# ----------------------------------------------------------------------
+# Sampling / evaluation config — AR-DiT-S/2 CIFAR-10 counterpart of
+# ``cifar10_sample.yaml``.
+#
+# Only two fields differ from the baseline DiT sampling config:
+#   * ``ckpt_path``    → points into the AR-DiT run directory.
+#   * ``output.dir``   → distinct eval output dir so AR-DiT and DiT
+#                        eval artefacts never collide.
+#
+# Everything else (sampler steps, guidance scale, seed, num_samples,
+# metrics config, FID reference stats path) is byte-identical to the
+# baseline. This keeps AR-DiT-vs-DiT metric comparisons apples-to-
+# apples.
+#
+# Note: as with the baseline, this config does NOT reference a
+# model_config — the architecture is always read from the checkpoint
+# itself, which guarantees train/eval cannot disagree on shape.
+# ----------------------------------------------------------------------
+
+# Path to the checkpoint to evaluate. Override at the CLI:
+#   ./scripts/eval_checkpoint.sh <some_other_ckpt.pt>
+ckpt_path: runs/ar_dit_s2_cifar/ckpt/latest.pt
+
+# Which set of weights to use:
+#   online      -> live training weights
+#   ema_<decay> -> the corresponding EMA shadow copy
+# Must exist in the checkpoint's `ema_states` (or be `online`).
+ema_tag: ema_0.9999
+
+# ---- Sampling ----
+sampling:
+  num_samples: 50000        # FID-grade community standard
+  batch_size_per_gpu: 256
+  num_steps: 50             # Euler steps (see doc/FlowMatching.md §6)
+  guidance_scale: 1.5       # classifier-free-guidance scale, see doc/FlowMatching.md §4.2
+  seed: 0
+
+# ---- Reference dataset (for FID stats only) ----
+dataset:
+  name: cifar10
+  root: /data/cifar10
+  download: false
+
+# ---- Metrics ----
+metrics:
+  fid: true
+  inception_score: true
+  fid_ref_stats: /data/cifar10/fid_ref_stats.npz   # null = compute on first run
+
+# ---- Output ----
+output:
+  dir: runs/ar_dit_s2_cifar/eval/
+  save_images: false        # if true: dump every generated image as PNG (slow, big)
+  save_grid: true           # save one 8x8 grid PNG for quick visual inspection
