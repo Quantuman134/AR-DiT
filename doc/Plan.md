@@ -89,8 +89,8 @@ tracked separately, not on this roadmap.
 | 3 | Evaluation stack (`eval/`)                          | ✅ Done   | FID + Inception Score via `torchmetrics`                         |
 | 4 | CIFAR-10 dataset adapter (`data/`)                  | ✅ Done   | dataset + transforms                                             |
 | 5 | Training / sampling entry points                    | ⚠️ Written, not yet reviewed | `train.py`, `sample.py`, `scripts/*.sh` |
-| 6 | Test suite Layers 1–4                               | ⚠️ Written, not yet reviewed | components / DiT / flow+eval+data / overfit-one-batch |
-| 7 | AR-DiT model (`models/ar_dit.py`)                   | ⏳ Todo   | Block AttnRes variant — the core contribution                   |
+| 6 | Test suite Layers 1–4                               | ⚠️ Written, not yet reviewed | components / DiT / AR-DiT / flow+eval+data / overfit-one-batch |
+| 7 | AR-DiT model (`models/ar_dit.py`)                   | ⚠️ Written, not yet reviewed | Per-sub-layer AttnRes junctions (paper-strict, v1) — the core contribution |
 | 8 | Layer-5 golden-output regression test               | 🔒 Deferred | Blocked on a trained checkpoint; see [Test.md](Test.md) §Layer 5 |
 
 Legend: ✅ done · ⚠️ written but unreviewed · ⏳ todo · 🔒 deferred by design.
