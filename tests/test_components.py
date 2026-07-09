@@ -1,7 +1,17 @@
-"""Layer 1 tests: per-component unit tests for ``models/dit.py``.
+"""Layer 1 tests: per-component unit tests for ``models/dit.py`` and
+``models/ar_dit.py``.
 
 See doc/Test.md for the test layering and which tests use hand-computed
 numerical values vs. behavioural / property checks.
+
+.. warning::
+
+   **This test file is provisional — written but not yet reviewed by the
+   project owner.** A passing run only means the tests are internally
+   consistent; it does not certify that the specified behaviour matches
+   the paper's intent. This applies to every test in this file, including
+   the ``AttnResJunction`` and ``ARDiTBlock`` sections. See
+   `doc/Plan.md` (Roadmap row 6) for the dedicated review pass.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from models.dit import (
     get_2d_sincos_pos_embed,
     modulate,
 )
+from models.ar_dit import ARDiTBlock, AttnResJunction
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +284,234 @@ def test_final_layer_zero_at_init():
     c = torch.randn(2, 32)
     out = fl(x, c)
     assert out.abs().max().item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# AttnResJunction  (AR-DiT — see doc/AR_DiT.md §4, §12)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("l", [1, 2, 24])
+def test_attnres_shape(l: int):
+    """Forward on a length-``l`` cache returns ``[B, N, D]``."""
+    B, N, D = 2, 9, 32
+    junction = AttnResJunction(hidden_size=D)
+    cache = [torch.randn(B, N, D) for _ in range(l)]
+    out = junction(cache)
+    assert out.shape == (B, N, D)
+    assert torch.isfinite(out).all()
+
+
+def test_attnres_zero_init_uniform_mix():
+    """Zero-init pseudo-query ⇒ output is the equal-weight average of sources.
+
+    This is the paper's uniform-init behaviour (doc/AR_DiT.md §10): with
+    ``w = 0`` every logit is zero, so ``alpha = 1/l`` for all sources
+    regardless of what ``RMSNorm`` does on the key path.
+    """
+    B, N, D, l = 2, 9, 32, 5
+    junction = AttnResJunction(hidden_size=D)   # w is zero-init by default.
+    cache = [torch.randn(B, N, D) for _ in range(l)]
+    out = junction(cache)
+    expected = torch.stack(cache, dim=0).mean(dim=0)   # (B, N, D)
+    torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_attnres_rmsnorm_inside_kernel_only():
+    """Scaling one source by a constant ``k`` must:
+
+    * leave the attention weights unchanged (RMSNorm inside the kernel
+      cancels positive rescalings on the key path), and
+    * scale that source's contribution to the output linearly (values
+      enter the weighted sum un-normed).
+
+    Concretely, if we scale source ``j`` by ``k > 0``:
+    ``out_new - out_old == alpha_j * (k - 1) * v_j``.
+    """
+    torch.manual_seed(0)
+    B, N, D, l = 2, 9, 32, 4
+    j, k = 1, 3.0
+
+    junction = AttnResJunction(hidden_size=D)
+    # Break the zero-init to give the softmax non-uniform weights so the
+    # test verifies "unchanged alpha" beyond the trivial 1/l case.
+    with torch.no_grad():
+        junction.w.copy_(torch.randn(D))
+
+    cache_old = [torch.randn(B, N, D) for _ in range(l)]
+    cache_new = [v.clone() for v in cache_old]
+    cache_new[j] = cache_new[j] * k
+
+    out_old = junction(cache_old)
+    out_new = junction(cache_new)
+
+    # --- Alpha unchanged: recompute alpha for both caches and compare. ---
+    def _alpha(cache):
+        sources = torch.stack(cache, dim=2)                    # [B, N, l, D]
+        logits = torch.einsum("d,bnld->bnl", junction.w, junction.rms(sources))
+        return torch.softmax(logits, dim=-1)                   # [B, N, l]
+
+    alpha_old = _alpha(cache_old)
+    alpha_new = _alpha(cache_new)
+    torch.testing.assert_close(alpha_new, alpha_old, atol=1e-5, rtol=1e-5)
+
+    # --- Output delta is exactly alpha_j * (k - 1) * v_j. ---
+    delta_expected = alpha_old[..., j:j + 1] * (k - 1.0) * cache_old[j]
+    torch.testing.assert_close(out_new - out_old, delta_expected, atol=1e-5, rtol=1e-5)
+
+
+def test_attnres_softmax_normalisation():
+    """Attention weights sum to 1 over the source axis for every (b, n)."""
+    torch.manual_seed(0)
+    B, N, D, l = 2, 9, 32, 6
+    junction = AttnResJunction(hidden_size=D)
+    with torch.no_grad():
+        junction.w.copy_(torch.randn(D))          # non-trivial (non-uniform) weights
+
+    cache = [torch.randn(B, N, D) for _ in range(l)]
+    sources = torch.stack(cache, dim=2)
+    logits = torch.einsum("d,bnld->bnl", junction.w, junction.rms(sources))
+    alpha = torch.softmax(logits, dim=-1)
+
+    ones = torch.ones(B, N)
+    torch.testing.assert_close(alpha.sum(dim=-1), ones, atol=1e-6, rtol=1e-5)
+    assert (alpha >= 0).all()
+
+
+def test_attnres_grad_flow_at_zero_init():
+    """At the zero-init state, gradients have a specific structure:
+
+    * ``w.grad`` is non-zero (uniform softmax has a non-trivial derivative
+      w.r.t. the logits, and the sources spread the values apart).
+    * ``rms.weight.grad`` is *exactly zero* — with ``w = 0`` the logit is
+      identically zero regardless of the RMSNorm scale ``g``, so ``g``
+      receives no gradient signal at initialisation. This is a real
+      property of the mechanism, worth recording explicitly.
+    """
+    torch.manual_seed(0)
+    B, N, D, l = 2, 9, 32, 4
+    junction = AttnResJunction(hidden_size=D)
+    cache = [torch.randn(B, N, D) for _ in range(l)]
+    out = junction(cache)
+    out.sum().backward()
+
+    assert junction.w.grad is not None
+    assert junction.rms.weight.grad is not None
+    assert torch.isfinite(junction.w.grad).all()
+    assert torch.isfinite(junction.rms.weight.grad).all()
+    assert junction.w.grad.abs().sum().item() > 0.0
+    # Documented property: g gets no gradient at the exact zero-init step.
+    assert junction.rms.weight.grad.abs().sum().item() == 0.0
+
+
+def test_attnres_grad_flow_once_trained():
+    """Once ``w`` is non-zero, gradients reach *both* learnable tensors.
+
+    This is the operating condition after even a single optimiser step,
+    so it is the practically-relevant grad-flow check.
+    """
+    torch.manual_seed(0)
+    B, N, D, l = 2, 9, 32, 4
+    junction = AttnResJunction(hidden_size=D)
+    with torch.no_grad():
+        junction.w.copy_(torch.randn(D))          # non-zero pseudo-query
+    cache = [torch.randn(B, N, D) for _ in range(l)]
+    out = junction(cache)
+    out.sum().backward()
+
+    assert junction.w.grad is not None
+    assert junction.rms.weight.grad is not None
+    assert torch.isfinite(junction.w.grad).all()
+    assert torch.isfinite(junction.rms.weight.grad).all()
+    assert junction.w.grad.abs().sum().item() > 0.0
+    assert junction.rms.weight.grad.abs().sum().item() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# ARDiTBlock  (AR-DiT — see doc/AR_DiT.md §5)
+# ---------------------------------------------------------------------------
+
+def test_ar_dit_block_shape():
+    """Forward returns ``[B, N, D]`` matching the input residual stream."""
+    block = ARDiTBlock(hidden_size=32, num_heads=4)
+    x = torch.randn(2, 9, 32)
+    c = torch.randn(2, 32)
+    cache = [x.clone()]                             # v_0
+    out = block(x, c, cache)
+    assert out.shape == x.shape
+
+
+def test_ar_dit_block_cache_grows_by_two():
+    """Each call appends exactly two entries (``v_msa``, ``v_mlp``) to the cache.
+
+    Prior cache contents must not be modified — the block is append-only.
+    """
+    block = ARDiTBlock(hidden_size=32, num_heads=4)
+    x = torch.randn(2, 9, 32)
+    c = torch.randn(2, 32)
+    v0 = torch.randn(2, 9, 32)
+    cache = [v0]
+    _ = block(x, c, cache)
+    assert len(cache) == 3
+    # v_0 preserved un-modified (identity check, not just close).
+    assert cache[0] is v0
+    # Appended entries have the sub-layer shape.
+    assert cache[1].shape == (2, 9, 32)
+    assert cache[2].shape == (2, 9, 32)
+
+
+def test_ar_dit_block_identity_when_adaln_zeroed():
+    """adaLN-Zero + AttnRes contract at init.
+
+    If we zero the final Linear of ``adaLN_modulation`` (as ``ARDiT._init_weights``
+    will do), every gate is zero ⇒ ``v_msa = v_mlp = 0`` are appended to
+    the cache. Then each junction produces an equal-weight mean over its
+    source pool — with ``[v_0, 0]`` the mean is ``v_0 / 2``; with
+    ``[v_0, 0, 0]`` it is ``v_0 / 3``. So the block output at init is
+    ``v_0 / 3``, exactly the "internal scaling of ``1/l``" behaviour
+    documented in doc/AR_DiT.md §10.
+    """
+    block = ARDiTBlock(hidden_size=32, num_heads=4)
+    torch.nn.init.zeros_(block.adaLN_modulation[-1].weight)
+    torch.nn.init.zeros_(block.adaLN_modulation[-1].bias)
+    v0 = torch.randn(2, 9, 32)
+    c = torch.randn(2, 32)
+    cache = [v0]
+    out = block(v0, c, cache)                       # x on entry == v_0
+    # MSA junction sees [v_0, 0]        -> mean = v_0 / 2
+    # MLP junction sees [v_0, 0, 0]     -> mean = v_0 / 3
+    torch.testing.assert_close(out, v0 / 3.0, atol=1e-6, rtol=1e-5)
+
+
+def test_ar_dit_block_grad_flow():
+    """Backward populates gradient on every learnable tensor of the block.
+
+    Uses non-zero adaLN and non-zero pseudo-queries so both AttnRes
+    junctions and both sub-layers are in a "trained" regime — this is
+    the practically relevant grad-flow check.
+    """
+    torch.manual_seed(0)
+    block = ARDiTBlock(hidden_size=32, num_heads=4)
+    with torch.no_grad():
+        block.attn_res_msa.w.copy_(torch.randn(32))
+        block.attn_res_mlp.w.copy_(torch.randn(32))
+    x = torch.randn(2, 9, 32)
+    c = torch.randn(2, 32)
+    cache = [x.clone()]
+    out = block(x, c, cache)
+    out.sum().backward()
+    for name, p in block.named_parameters():
+        assert p.grad is not None, f"{name} has no gradient"
+        assert torch.isfinite(p.grad).all(), f"{name} has non-finite gradient"
+
+
+def test_ar_dit_block_paramcount_vs_dit_block():
+    """AR-DiT block adds exactly ``4 * D`` learnable scalars over baseline DiT
+    (two junctions × two vectors of length D each: ``w`` and ``rms.weight``).
+    """
+    D, H = 32, 4
+    ar_block = ARDiTBlock(hidden_size=D, num_heads=H)
+    dit_block = DiTBlock(hidden_size=D, num_heads=H)
+    diff = sum(p.numel() for p in ar_block.parameters()) - sum(
+        p.numel() for p in dit_block.parameters()
+    )
+    assert diff == 4 * D
