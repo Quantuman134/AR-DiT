@@ -122,8 +122,80 @@ class FIDMetric:
         self._metric.update(_to_uint8(images).to(self.device), real=False)
 
     def compute(self) -> float:
-        """Return the current FID as a Python float."""
-        return float(self._metric.compute().item())
+        """Return the current FID as a Python float.
+
+        Workaround for a cuSOLVER × driver bug that makes
+        ``torch.linalg.eigvals`` (called inside torchmetrics'
+        ``_compute_fid``) fail with ``CUDA driver error: invalid
+        argument`` on some GPU/driver combinations at the 2048×2048
+        non-symmetric eigendecomposition step.
+
+        Strategy: manually all-reduce the sharded fake-side running sums
+        on CUDA using NCCL (safe; the replicated real-side sums are left
+        untouched — see step 1), then migrate the metric to CPU where LAPACK's
+        ``geev`` is reliable, run ``compute()`` there with torchmetrics'
+        internal sync disabled, and finally restore the metric back to
+        CUDA with sync re-enabled for future validation passes.
+        """
+        m = self._metric
+
+        # ---- 1. Manual all-reduce on CUDA (NCCL-friendly).
+        #
+        # ONLY the fake-side buffers are reduced.  Each rank generates a
+        # disjoint shard of the fake samples, so summing across ranks is
+        # correct and gives the global fake statistics.  reset_fake()
+        # zeroes these before every pass, so the reduction starts clean
+        # each time.
+        #
+        # The real-side buffers must NOT be reduced: they are *replicated*,
+        # not sharded — every rank loads the identical reference stats from
+        # the same cache (see load_reference) and never updates them during
+        # training.  They are therefore already global on every rank.  A
+        # SUM all-reduce would multiply them by world_size, and because the
+        # real buffers are never reset (reset_real_features=False,
+        # reset_fake() leaves them alone), that factor compounds ×world_size
+        # on every compute() call until real_features_num_samples (int64)
+        # overflows to a negative value and torchmetrics' "more than one
+        # sample" guard trips.  Leaving them untouched keeps the global real
+        # stats correct.
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            for name in (
+                "fake_features_sum",
+                "fake_features_cov_sum",
+                "fake_features_num_samples",
+            ):
+                buf = getattr(m, name)
+                torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+
+        # ---- 2. Disable torchmetrics' internal sync for the CPU
+        #        compute() call.  The gating flag is ``_to_sync``
+        #        (an internal attribute), NOT ``sync_on_compute``.
+        #        We also flip ``_should_unsync`` so torchmetrics does
+        #        not try to "restore local state" from a sync that
+        #        never happened.
+        prev_to_sync = m._to_sync
+        prev_should_unsync = m._should_unsync
+        m._to_sync = False
+        m._should_unsync = False
+
+        orig_device = m.fake_features_sum.device
+        try:
+            # ---- 3. Migrate to CPU and run the eigen step there.
+            if orig_device.type == "cuda":
+                m.to("cpu")
+            val = float(m.compute().item())
+        finally:
+            # ---- 4. Restore metric state for the next validation pass.
+            if orig_device.type == "cuda":
+                m.to(orig_device)
+            m._to_sync = prev_to_sync
+            m._should_unsync = prev_should_unsync
+
+        return val
 
     def reset_fake(self) -> None:
         """Reset only the fake-side accumulators (real cache is preserved).
