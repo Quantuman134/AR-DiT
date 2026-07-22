@@ -8,7 +8,7 @@
 
 # Architecture is defined in a separate file. The relative path is
 # resolved against this YAML's directory.
-model_config: ../model/dit_s2_cifar.yaml
+model_config: ../model/dit_xl2_cifar.yaml
 
 # ---- Dataset ----
 # `root` is intentionally an absolute path so the same config + same
@@ -16,9 +16,9 @@ model_config: ../model/dit_s2_cifar.yaml
 # passing --dataset_root on the command line; the CLI wins).
 dataset:
   name: cifar10
-  root: /data/cifar10
+  root: /scratch/project/prj-02-visual-ai/hkzhang/cifar10/cifar10_imagefolder
   download: false           # never download silently; if missing, fail loudly
-  num_workers: 4
+  num_workers: 16
   pin_memory: true
   augment: true             # RandomHorizontalFlip(p=0.5); off for validation loader
 
@@ -28,24 +28,24 @@ optim:
   lr: 1.0e-4
   betas: [0.9, 0.999]
   weight_decay: 0.0
-  grad_clip: 1.0            # null = disabled
+  grad_clip: null            # null = disabled
   warmup_steps: 1000
   lr_schedule: constant     # one of: constant, cosine
 
 # ---- Training loop ----
 train:
-  total_steps: 400000
-  batch_size_per_gpu: 128
+  total_steps: 800000
+  batch_size_per_gpu: 16
   grad_accum_steps: 1
   log_interval: 50          # steps between terminal/wandb scalar logs
-  ckpt_interval: 10000      # steps between checkpoints
-  seed: 0
-  amp_dtype: bf16           # one of: fp32, bf16
+  ckpt_interval: 80000      # steps between checkpoints
+  seed: 42
+  amp_dtype: fp32           # one of: fp32, bf16
 
 # ---- EMA (one shadow copy per decay value) ----
 # See doc/FlowMatching.md §5.
 ema:
-  decays: [0.9999, 0.999]
+  decays: [0.9999]
 
 # ---- Classifier-free guidance ----
 # class_dropout_prob lives in the model config because it is owned by
@@ -57,24 +57,24 @@ guidance:
 # ---- Validation (rank-0 only) ----
 # See doc/Train.md §7.
 validation:
-  interval: 10000           # steps between validation passes
-  num_samples: 32           # generated images per (ema, guidance-scale) pair
+  interval: 8000           # steps between validation passes
+  num_samples: 5000           # generated images per (ema, guidance-scale) pair
   batch_size_per_gpu: 128   # per-chunk generation size; bounds validation VRAM
                             # independent of num_samples. FID/IS compute() is
                             # mathematically identical to a single-shot call.
-  visual_log_count: 16      # how many of those to log to wandb as a grid
-  guidance_scales: [1.0, 1.5, 4.0]
+  visual_log_count: 64      # how many of those to log to wandb as a grid
+  guidance_scales: [1.0]
   metrics:
     fid: true
     inception_score: true
-  fid_ref_stats: /data/cifar10/fid_ref_stats.npz   # null = compute on first run
+  fid_ref_stats: /scratch/project/prj-02-visual-ai/hkzhang/cifar10/fid_ref_stats.npz   # null = compute on first run
   sampler:
     num_steps: 50           # Euler steps used during validation
 
 # ---- Logging / I/O ----
 logging:
   out_dir: runs/
-  run_name: dit_s2_cifar    # final dir = runs/dit_s2_cifar/
+  run_name: dit_xl2_cifar    # final dir = runs/dit_xl2_cifar/
   wandb:
     enabled: true
     project: attn_residual_dit

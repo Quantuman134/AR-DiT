@@ -1,0 +1,28 @@
+# ----------------------------------------------------------------------
+# Model architecture config — AR-DiT-S/2 on CIFAR-10 (pixel space).
+#
+# This is the drop-in AR-DiT counterpart of ``dit_s2_cifar.yaml``.
+# Every dataset-facing field (input_size / in_channels / patch_size /
+# num_classes / class_dropout_prob) is identical to the baseline DiT
+# config; only ``arch_name`` differs. That is intentional — the paper's
+# claim is a same-shape same-compute drop-in swap of the residual, so
+# the fair comparison is with everything else held equal.
+#
+# See doc/AR_DiT.md for the architecture spec and doc/DiT.md for the
+# meaning of each field.
+# ----------------------------------------------------------------------
+
+arch_name: ARDiT_XL_2        # one of: ARDiT_S_2, ARDiT_B_2, ARDiT_L_2, ARDiT_XL_2
+                            # (selects (depth, hidden_size, num_heads); the
+                            # remaining fields below are independent of the
+                            # preset and override the preset's defaults.)
+
+input_size: 32              # H = W
+in_channels: 3              # CIFAR-10 RGB; pixel space (no VAE).
+patch_size: 2               # PatchEmbed kernel/stride. 32 / 2 = 16x16 = 256 tokens.
+
+num_classes: 10             # CIFAR-10 has 10 classes; +1 null slot is added
+                            # internally by LabelEmbedder for CFG.
+
+class_dropout_prob: 0.1     # CFG label-dropout probability during training.
+                            # See doc/FlowMatching.md §4.1.
