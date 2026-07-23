@@ -408,12 +408,19 @@ and points at a user-supplied checkpoint:
 
 ### 6.1 Token handling
 
+- The `wandb` Python package is a first-party runtime dependency
+  (pinned in [`pyproject.toml`](../pyproject.toml)) and is installed by
+  `pip install -e ".[dev]"`.
 - The wandb API token lives in `secrets/wandb.token` (a single line).
-- `secrets/` is gitignored.
+- `secrets/` is committed to the repo (via a `.gitkeep` placeholder)
+  but its contents are gitignored, so the token stays on the local
+  machine only.
 - On every rank, `train.py` reads the token *only on rank 0*, calls
   `wandb.login(key=...)`, and then `wandb.init(...)`.
-- If `logging.wandb.enabled = false` or the token file is missing,
-  training proceeds without wandb and prints a warning once.
+- If `logging.wandb.enabled = false`, `logging.wandb.mode = disabled`,
+  the token file is missing, or the `wandb` package cannot be imported,
+  training proceeds without wandb and prints a warning once. This is
+  the intended offline / no-tracking path.
 
 ### 6.2 What gets logged
 

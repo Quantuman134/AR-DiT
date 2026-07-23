@@ -58,7 +58,43 @@ pip install -e ".[dev]"
 ```
 
 `pip install -e ".[dev]"` pulls in the runtime deps (`torchmetrics`,
-`torch-fidelity`, `scipy`, `numpy`, `Pillow`, `PyYAML`) plus `pytest`.
+`torch-fidelity`, `scipy`, `numpy`, `Pillow`, `PyYAML`, `wandb`) plus
+`pytest`.
+
+### Weights & Biases (optional but on by default)
+
+Training logs scalars and validation grids to
+[Weights & Biases](https://wandb.ai). To enable it on a fresh checkout:
+
+1. Put your personal API key (a single line, no trailing newline) into
+   `secrets/wandb.token`. The `secrets/` folder is tracked but its
+   contents are gitignored — see [`.gitignore`](.gitignore) — so the
+   token stays local:
+
+   ```bash
+   echo "$WANDB_API_KEY" > secrets/wandb.token
+   chmod 600 secrets/wandb.token
+   ```
+
+2. Set the project / entity / mode in your training YAML under
+   `logging.wandb` (defaults live in
+   [`configs/train/cifar10_train.yaml`](configs/train/cifar10_train.yaml)):
+
+   ```yaml
+   logging:
+     wandb:
+       enabled: true
+       project: attn_residual_dit
+       entity: null            # null = personal account
+       token_path: secrets/wandb.token
+       mode: online            # online | offline | disabled
+   ```
+
+3. To skip wandb entirely (e.g. on an offline node) set
+   `logging.wandb.enabled: false` or `mode: disabled`. Training also
+   degrades gracefully if the `wandb` package is missing or the token
+   file cannot be read — see [`doc/Train.md`](doc/Train.md) §6 for the
+   full spec.
 
 ## Usage
 

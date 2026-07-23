@@ -61,7 +61,11 @@ data/*
 datasets/
 
 # --- Secrets (wandb token, API keys, etc.) ---
-secrets/
+# Keep the folder itself tracked (via secrets/.gitkeep) so a fresh
+# clone always has a canonical place to drop `wandb.token`, but never
+# commit the credentials themselves.
+secrets/*
+!secrets/.gitkeep
 
 # --- Reference papers / large binaries (keep out of repo) ---
 *.pdf
