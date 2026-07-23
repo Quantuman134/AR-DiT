@@ -46,6 +46,11 @@ dependencies = [
 
     # --- config loading (used from Phase C onward) ---------------------------
     "PyYAML>=6.0",
+
+    # --- experiment tracking (train.py logs scalars + validation grids) ------
+    # Rank-0-only; degrades gracefully to a no-op if the token file is
+    # missing (see train.py::init_wandb and doc/Train.md §6.1).
+    "wandb>=0.16",
 ]
 
 [project.optional-dependencies]
