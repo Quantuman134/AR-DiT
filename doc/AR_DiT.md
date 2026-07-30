@@ -383,6 +383,350 @@ top of the v1 codebase.
 
 ---
 
+## 9a. E1 — Time-conditioned pseudo-query (first implemented extension)
+
+The v1 spec above (§§ 1–8, 10–14) is the paper-strict port. §9a is the
+**first extension we actually implement**: it lifts entry E1 from the
+ablation menu into a real, testable model, following the same
+sign-off-before-code discipline as v1.
+
+E1 leaves every other AttnRes design choice untouched — same 2L
+junctions (§3), same operator (§4), same per-patch weights (§6), same
+per-junction RMSNorm (§7), same pre-residual value source (§8). The
+sole change is **where each junction's pseudo-query comes from**.
+
+### 9a.1 Mechanism
+
+v1 uses a **constant per-junction pseudo-query**:
+
+```
+q_l = w_l                              # w_l ∈ ℝ^D, a learned constant vector.
+```
+
+E1 replaces this with a **time-conditioned pseudo-query**:
+
+```
+τ    = MLP_shared(t_emb)               # [B, D]  — one shared 2-layer MLP, computed once
+q_l  = W_l · τ + w_l                   # [B, D]  — per-junction linear head + additive bias
+```
+
+with
+
+- `t_emb ∈ ℝ^{B×D}` — the existing `TimestepEmbedder(t)` output (the
+  same tensor DiT already computes at the top of `forward`).
+- `MLP_shared: ℝ^D → ℝ^D` — a 2-layer MLP `Linear(D, D) → SiLU →
+  Linear(D, D)`, shared across **all 2L junctions**. Learns "how to
+  represent the current denoising phase".
+- `W_l: ℝ^D → ℝ^D` — a per-junction linear head, `nn.Linear(D, D,
+  bias=False)`. One `W_l` per AttnRes junction (2L total). Learns "how
+  this specific junction wants to weight sources given the phase
+  representation".
+- `w_l ∈ ℝ^D` — v1's learnable constant, retained as an **additive
+  bias**. Zero-init, as in v1. Keeps the "E1 = v1 + a time-dependent
+  perturbation" framing crisp: at `τ = 0` (or at `W_l = 0`), E1
+  degenerates to v1 exactly.
+
+**Everything else in the AttnRes operator is byte-identical to §4**:
+the kernel is still `ϕ(q, k) = exp(q · RMSNorm(k))` with `k_i := v_i`,
+the softmax is still over the source-junction axis (length `l`), the
+attention weights are still per-patch (`α ∈ ℝ^{B×N×l}`), and the values
+are still consumed un-normed in the weighted sum.
+
+The only observable shape change on the operator's input side is that
+the query is now `[B, D]` instead of `[D]` — i.e. one query per image
+(and per junction), not a global constant. Concretely the logit
+einsum changes from
+
+```
+logits = einsum("d,   bnld -> bnl", w_l,          keys_normed)     # v1
+```
+
+to
+
+```
+logits = einsum("bd,  bnld -> bnl", q_l,          keys_normed)     # E1
+```
+
+with `q_l = W_l(τ) + w_l`. The output shape `[B, N, l]` is unchanged.
+
+### 9a.2 Signal source — `t_emb`, not `c` (fork #1 decision)
+
+**Locked decision**: the shared trunk reads **`t_emb`** — the raw
+`TimestepEmbedder(t)` output — **not** the adaLN-Zero conditioning
+vector `c = t_emb + y_emb`.
+
+- Chosen: `τ = MLP_shared(t_emb)`. Depth-mixing weights depend purely
+  on the timestep.
+- Rejected alternative: `τ = MLP_shared(c)`. Would let the class label
+  also modulate the depth mix.
+
+**Why `t_emb` only**:
+
+1. **Faithful to the "time-conditioned" framing.** Plan.md line 23
+   describes E1 verbatim as "timestep-conditioned pseudo-queries
+   `w_l(t)`". Using `c` would smuggle class information through the
+   name.
+2. **Cleaner ablation.** Any FID delta E1-vs-v1 is attributable to
+   the time signal alone, not to a second class-conditioning path
+   competing with adaLN-Zero's existing one.
+3. **Two independent branches, one purpose each.** In `ARDiTCond`,
+   `t_emb` fans out to two consumers: (a) the adaLN-Zero path
+   (`c = t_emb + y_emb` → `adaLN_modulation(c)` per block, unchanged),
+   and (b) the E1 path (`τ = MLP_shared(t_emb)` → per-junction
+   query, new). Class information continues to flow into every block
+   *only* through the adaLN path. This separation of concerns is the
+   whole point of picking `t_emb`.
+
+**Ablation note (recorded, not implemented in E1 v1)**: swapping
+`t_emb` → `c` in the trunk input is a natural follow-up. It answers
+"does the class-conditioning signal in the depth mix help further, or
+does it hurt by fighting adaLN-Zero?"
+
+### 9a.3 Query factorisation — shared trunk + per-junction head (fork #2 decision)
+
+**Locked decision**: option **δ** — a shared 2-layer trunk producing a
+common phase representation `τ`, followed by a per-junction linear
+head `W_l` that projects `τ` into the junction's query.
+
+For completeness, the design space we considered:
+
+| Option | Formula                                     | Extra params per junction     | Total for DiT-S/2 (2L=24, D=384) |
+|--------|---------------------------------------------|-------------------------------|----------------------------------|
+| α      | `q_l = w_l + b_l · MLP_shared(t_emb)`       | `D` scalar bias                | ~9 K + one shared MLP            |
+| β      | `q_l = W_l · t_emb + w_l`                   | `D² + D ≈ 148 K`               | ~3.5 M (no shared trunk)         |
+| γ      | `q_l = MLP_l(t_emb)` (per-junction 2-layer) | `2·D² ≈ 295 K`                 | ~7 M                             |
+| **δ**  | `q_l = W_l · MLP_shared(t_emb) + w_l`       | `D²` per junction + shared MLP | **~3.83 M**                      |
+
+**Why δ**:
+
+1. **Right factorisation.** All 2L junctions consume the same input
+   `t_emb`. Having each learn its own 2-layer MLP over that input (γ)
+   would waste capacity re-learning the same "what phase are we in"
+   representation 2L times. Factoring it out into a shared trunk lets
+   the 2L per-junction heads specialise on the more targeted question
+   *"given the phase, what does this junction want?"*.
+2. **Preserves v1 exactly at `W_l = 0`.** With `W_l = 0` in every
+   head, `q_l = w_l` — literally the v1 pseudo-query. E1 is thus a
+   strict superset of v1: any FID improvement must come from the
+   *learned* time-dependence introduced by non-zero `W_l`.
+3. **Cheaper than γ, more expressive than α.** ~3.83 M new params
+   (~12 % on top of DiT-S/2's 33 M) — noticeable but affordable in the
+   ablation-cost budget. α (additive bias only) would give every
+   junction the same time-dependent perturbation, differing only by a
+   scalar magnitude — too weak.
+4. **Symmetric with adaLN-Zero.** adaLN's per-block modulation MLP
+   already reads a shared vector (`c`) and emits per-block affine
+   parameters. δ applies the same shared-trunk + per-junction-head
+   pattern to the query side of AttnRes.
+
+**Ablation note (recorded, not implemented)**: α (additive-bias-only)
+is a cheap alternative. Worth trying if E1-δ turns out to help —
+answers "is the per-junction-head worth its ~3.5 M param cost, or is
+per-junction time modulation via a scalar gate enough?"
+
+### 9a.4 Parameter cost
+
+For DiT-S/2 (`D = 384`, `L = 12` ⇒ `2L = 24` junctions):
+
+| Item                                         | Formula                | Count       |
+|----------------------------------------------|------------------------|-------------|
+| Shared trunk (`Linear(D,D) → SiLU → Linear(D,D)`) | `2·D² + 2·D`      | ~295 K      |
+| Per-junction heads (`W_l`, no bias)          | `2L · D²`              | ~3.54 M     |
+| **E1 new params**                            | (sum)                  | **~3.83 M** |
+| v1 AttnRes params (for reference)            | `2L · 2·D`             | ~18 K       |
+| Baseline DiT-S/2                             | —                      | ~33 M       |
+| **`ARDiTCond` total**                        | (sum)                  | **~37 M**   |
+
+Percentage overhead of E1 over baseline DiT: **~12 %**. Compare with
+v1's ~0.056 % — E1 is materially larger than v1 but still an order of
+magnitude smaller than an equivalent-parameter-count expansion of the
+MHSA/MLP path.
+
+### 9a.5 Initialisation and the step-0 invariant
+
+**Locked decision**: `W_l.weight = 0`, `w_l = 0`, `MLP_shared`
+Xavier-uniform (via the generic init pass), everything else identical
+to `ARDiT`.
+
+**Why zero-init on `W_l`**: v1's §12 acceptance criterion —
+`ARDiT(x, t, y) == 0` bit-exactly at step 0 — must survive to E1. The
+argument for v1 was: `w_l = 0` gives `α_{i→l} = 1/l` (uniform mix), all
+adaLN gates are zero, so the cache is `[v_0, 0, ..., 0]`, and
+`FinalLayer.linear = 0` zeros the output regardless.
+
+For E1 the same conclusion holds *only if* `q_l ≡ 0` at step 0 for
+every `t` and every `l`. With option δ:
+
+- `q_l = W_l(τ) + w_l`.
+- `W_l.weight = 0`  ⇒  `W_l(τ) = 0` for any `τ`.
+- `w_l = 0`         ⇒  additive bias contributes nothing.
+- Therefore `q_l ≡ 0` for every `t`, every `l`.
+
+The `MLP_shared` trunk gets Xavier init (via `_init_weights`'s generic
+pass), because its output `τ` is annihilated by `W_l = 0` at step 0 and
+so any finite init is safe — Xavier is chosen for consistency with the
+rest of the model.
+
+With `q_l ≡ 0` in every junction, every logit is `0`, every softmax
+becomes uniform `1/l`, the cache stays `[v_0, 0, ..., 0]` (adaLN gates
+still zero at init, unchanged from v1), `FinalLayer.linear` is still
+zero — so the model output is bit-exactly zero. Same observable as v1,
+same test (see §9a.8).
+
+**What "learning `W_l` away from zero" looks like**: the gradient of
+the loss w.r.t. `W_l.weight` at step 0 is non-zero as long as `τ` is
+non-zero (and it will be — Xavier'd trunk with a non-zero `t_emb`
+input gives a non-zero `τ`). So `W_l` starts moving on step 1 exactly
+as adaLN's zero-init modulation MLPs do — the same gradient flow
+mechanism, applied to the E1 query path.
+
+### 9a.6 Module placement and code shape (fork #4 decision)
+
+**Locked decision**: the shared trunk is a **model-level** module owned
+by `ARDiTCond`; per-junction heads `W_l` live on `ARDiTCondBlock`; the
+inner `AttnResJunction` gains one optional `q_override` kwarg so the
+same softmax-mix code path serves both v1 and E1.
+
+Concretely:
+
+- **`ARDiTCond.__init__`** owns `self.t_query_trunk =
+  TimeQueryTrunk(D)` — a single module for the whole network.
+- **`ARDiTCond.forward`** computes `τ = self.t_query_trunk(t_emb)`
+  **once**, right after `t_emb` is produced, and threads it as an
+  extra argument into every block. `c = t_emb + y_emb` is still built
+  the same way and still drives adaLN-Zero unchanged.
+- **`ARDiTCondBlock`** owns two per-junction heads: `self.W_msa =
+  nn.Linear(D, D, bias=False)` (for the MSA junction, junction index
+  `2b+1`) and `self.W_mlp` (for the MLP junction, junction index
+  `2b+2`). Both zero-init.
+- **`ARDiTCondBlock.forward(x, c, tau, cache)`** computes `q_msa =
+  self.W_msa(tau) + self.attn_res_msa.w` and passes it as
+  `q_override=q_msa` when calling the shared `AttnResJunction`. Same
+  for MLP. The rest of the block is byte-identical to `ARDiTBlock`.
+- **`AttnResJunction.forward`** gains `q_override: Tensor | None =
+  None`. `None` → v1 einsum (`"d,bnld->bnl"`, using `self.w`);
+  provided → E1 einsum (`"bd,bnld->bnl"`, using `q_override`). No
+  duplication of the softmax-mix math.
+
+**Why the split "trunk on model / heads on block"**: the trunk is
+shared across all 2L junctions, so it belongs to the outer container.
+The heads are junction-specific and there are two per block, so they
+belong to the block. The junction itself is just the softmax-mix
+kernel and stays unchanged in structure — this keeps §4 (the paper's
+Eq. 2/4 operator) canonical.
+
+**Why the `q_override` kwarg (not two junction classes)**: the E1
+change is *entirely* in how the query is constructed; the mixing math
+is identical. Duplicating `AttnResJunction` into a `AttnResJunctionCond`
+just to swap one einsum string would leave the paper's core operator
+maintained in two places. One kwarg with a `None` default preserves the
+v1 code path byte-identically while making the E1 path opt-in.
+
+### 9a.7 File / API layout
+
+```
+models/
+├── dit.py             # (unchanged)
+└── ar_dit.py          # (extended, no destructive edits)
+    ├── class AttnResJunction(nn.Module)      # (existing) — forward gains q_override kwarg
+    ├── class ARDiTBlock(nn.Module)           # (existing) — unchanged
+    ├── class ARDiT(nn.Module)                # (existing) — unchanged
+    ├── def ARDiT_{S,B,L,XL}_2                # (existing) — unchanged
+    ├── class TimeQueryTrunk(nn.Module)       # NEW — shared 2-layer MLP
+    ├── class ARDiTCondBlock(nn.Module)       # NEW — E1 block, owns W_msa / W_mlp
+    ├── class ARDiTCond(nn.Module)            # NEW — E1 end-to-end model
+    └── def ARDiTCond_{S,B,L,XL}_2            # NEW — presets parallel to ARDiT_*_2
+```
+
+**`ARDiTCond` public API is identical to `ARDiT`** — same `__init__`
+signature (no new required kwargs; the trunk / heads are constructed
+internally from `hidden_size` and `depth`), same `forward(x, t, y)
+-> Tensor`, same output shape. This means:
+
+- `train.py`, `sample.py`, `flow/`, `eval/`, and every existing config
+  keep working unchanged.
+- Selection between v1 and E1 is **purely** via config
+  (`arch_name: ARDiTCond_S_2` vs `arch_name: ARDiT_S_2`). No boolean
+  flags anywhere.
+
+**Config**: new `configs/model/ar_dit_cond_s2_cifar.yaml`, a copy of
+`configs/model/ar_dit_s2_cifar.yaml` with `arch_name` changed and the
+header comment updated. **Registry**: the four new presets are added
+to `models/__init__.py`'s `_ARCH_PRESETS` and to `__all__`.
+
+### 9a.8 Test plan (extension of §12)
+
+New tests in `tests/test_ar_dit.py` (appended, not replacing v1
+tests). Each parallels a v1 test where one exists, plus one new
+smoking-gun test unique to E1.
+
+| Test | Assertion | Purpose |
+|------|-----------|---------|
+| `test_ardit_cond_forward_shape_and_dtype` | Output is `[B, C, H, W]`, `float32`. | Same shape contract as `ARDiT`. |
+| `test_ardit_cond_zero_init_output_is_zero` | `torch.equal(ARDiTCond(x, t, y), zeros_like(...))` at init. | Same acceptance criterion as v1 §12; §9a.5 argues this must hold. |
+| `test_ardit_cond_zero_init_uniform_mix` | Hook `FinalLayer`'s input at init; assert it equals `v_0 / (2L + 1)` for `t = 0.01` **and** `t = 0.99`. | Diagnostic — verifies the depth mix is uniform *and time-invariant* at init, distinguishing E1's step-0 mechanism (`q_l ≡ 0` for every `t`) from a bug where a non-zero `W_l` leaks. |
+| `test_ardit_cond_param_count_diff` | `(ARDiTCond).num_params - (ARDiT).num_params == 2·D² + 2·D + 2L·D²`. | Analytical formula, computed directly from `(D, L)` so a config change flows through cleanly. |
+| `test_ardit_cond_time_dependence` | After manually setting `blocks[-1].W_mlp.weight` to `randn(D, D) * 1.0` **and** `FinalLayer.linear.weight` to `randn(...) * 1.0`, changing `t` alone (holding `x, y` fixed) changes the model output by `> 1e-2` in max-abs. | **Smoking-gun**: E1 actually depends on `t` via the AttnRes path, not just via adaLN-Zero. See "Zero-init gradient dams" note below for why the last MLP junction, and not block 0's MSA junction, is the correct perturbation site. |
+| `test_ardit_cond_grad_flow` | Forward + MSE + backward at init; assert every parameter (v1 and E1) has `p.grad is not None and torch.isfinite(p.grad).all()`. | Structural reachability check — the E1 modules are on the backward graph. See "Zero-init gradient dams" note below for why the numerical `grad != 0` version is spec-broken at step 0. |
+
+**Note on `test_ardit_cond_time_dependence`**: baseline `ARDiT` and
+v1's tests do not assert time-dependence of the AttnRes path (v1
+`α_{i→l}` is time-independent by construction). This test is
+E1-specific and is the strongest positive evidence that the extension
+works as designed.
+
+**Zero-init gradient dams — a design consequence worth naming**.
+Adding these tests surfaced two non-obvious implications of §9a.5's
+zero-init story that future ablation authors should be aware of:
+
+1. **The adaLN-Zero *value* dam propagates through junctions.** With
+   every `gate_msa = gate_mlp = 0` at init, `v_i = 0` for all `i ≥ 1`
+   in the cache. A `t`-dependent junction output `h_l` becomes the
+   input `x` of the *next* sub-layer, but that sub-layer's contribution
+   `v_{l+1} = gate · f(...)` is then zero — so the E1 signal never
+   enters any downstream cache entry, only ever the intermediate `x`
+   which is then multiplied by zero. A perturbation to `W_l` at an
+   *early* junction is therefore invisible at the model output at
+   init; only the *last* junction (whose output feeds `FinalLayer`
+   directly) produces a visible signal. This is why
+   `test_ardit_cond_time_dependence` perturbs `blocks[-1].W_mlp`.
+2. **The zero-init *gradient* dam propagates through parameters.**
+   `FinalLayer.linear.weight = 0` makes the model bit-exactly zero at
+   init, so `∂L/∂h = ∂L/∂output · linear.weight^T = 0` — every
+   parameter upstream of `FinalLayer.linear` receives numerically-zero
+   gradient at step 0. Additionally, since `∂L/∂τ = Σ_l W_l^T ·
+   ∂L/∂q_l`, and every `W_l = 0`, the shared trunk `t_query_trunk`
+   would receive zero gradient even if the `FinalLayer` dam were
+   lifted. This is intentional — the same warm-up behaviour
+   adaLN-Zero itself exhibits, extended by one more zero-init layer.
+   Only `FinalLayer.linear.{weight,bias}` receive non-zero gradient at
+   step 0; everything else unfreezes progressively over the first few
+   optimiser steps. A step-0 `grad != 0` assertion on E1 params would
+   therefore be spec-broken — instead the test uses `p.grad is not None`
+   (structural reachability), which distinguishes "on the backward
+   graph, numerically zero at init" from "orphaned, never called in
+   `forward`".
+
+The provisional-test warning from `doc/Plan.md` still applies — these
+tests are written for coverage, not correctness certification, until
+the dedicated review pass.
+
+### 9a.9 Open questions (recorded, not blocking)
+
+1. **Trunk depth.** We chose 2-layer `D → D → D` mirroring
+   `TimestepEmbedder`'s style. Whether 1-layer (`Linear(D, D)` only)
+   suffices, or whether an mlp_ratio=4 expansion helps, is unmeasured.
+2. **Trunk input.** `t_emb` vs `c` (§9a.2's ablation).
+3. **Bias on `W_l`.** We chose `bias=False` since `w_l` already plays
+   that role; whether adding a redundant bias helps optimisation is
+   unmeasured.
+4. **α (additive-bias-only) as a cheaper alternative.** §9a.3
+   footnotes this — worth a follow-up if E1-δ works.
+
+None of these are on E1's critical path.
+
+---
+
 ## 10. Initialisation
 
 **Locked decision**: `w_l = 0` for all `l`, `g_l = 1` for all RMSNorms.
