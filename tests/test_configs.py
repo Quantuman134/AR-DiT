@@ -66,6 +66,10 @@ def test_shipped_train_yaml_loads_and_embeds_model():
     assert t.validation.sampler.num_steps == 50
     assert t.validation.batch_size_per_gpu > 0    # chunked-validation field
     assert t.logging.wandb.mode == "online"
+    # New in feature/grad-norm-inspection: field must exist and default
+    # to enabled=true, granularity='group' (see doc/Train.md §6 note).
+    assert t.logging.grad_norm_inspection.enabled is True
+    assert t.logging.grad_norm_inspection.granularity == "group"
 
 
 def test_shipped_sample_yaml_loads():
@@ -427,3 +431,87 @@ def test_top_level_yaml_must_be_mapping(tmp_path):
 def test_missing_file_is_a_clear_error(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_model_config(tmp_path / "nope.yaml")
+
+
+# ---------------------------------------------------------------------------
+# GradNormConfig — the new logging.grad_norm_inspection sub-block
+# ---------------------------------------------------------------------------
+
+def test_grad_norm_inspection_defaults_when_omitted_from_yaml(tmp_path):
+    """A YAML that does not mention ``grad_norm_inspection`` must still
+    parse — the field has a dataclass-level default.  Default is off."""
+    train_path = _write_train_pair(tmp_path)
+    # _write_train_pair does not include grad_norm_inspection; keep it
+    # that way for this test.
+    t = load_train_config(train_path)
+    assert t.logging.grad_norm_inspection.enabled is False
+    assert t.logging.grad_norm_inspection.granularity == "group"
+
+
+def test_grad_norm_inspection_accepts_all_valid_granularities(tmp_path):
+    for gran in ("off", "global", "group", "block"):
+        train_path = _write_train_pair(tmp_path)
+        data = yaml.safe_load(train_path.read_text())
+        # 'off' is inconsistent with enabled=true — use enabled=false.
+        data["logging"]["grad_norm_inspection"] = {
+            "enabled": gran != "off",
+            "granularity": gran,
+        }
+        train_path.write_text(yaml.safe_dump(data))
+        t = load_train_config(train_path)
+        assert t.logging.grad_norm_inspection.granularity == gran
+
+
+def test_grad_norm_inspection_rejects_bad_granularity(tmp_path):
+    train_path = _write_train_pair(tmp_path)
+    data = yaml.safe_load(train_path.read_text())
+    data["logging"]["grad_norm_inspection"] = {
+        "enabled": True,
+        "granularity": "per-parameter",
+    }
+    train_path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ConfigError, match="granularity"):
+        load_train_config(train_path)
+
+
+def test_grad_norm_inspection_rejects_enabled_with_off_granularity(tmp_path):
+    """enabled=true is inconsistent with granularity='off' — both
+    encode 'do not measure', so allowing them to disagree would be a
+    foot-gun (the loop reads ``enabled``, the helper reads granularity)."""
+    train_path = _write_train_pair(tmp_path)
+    data = yaml.safe_load(train_path.read_text())
+    data["logging"]["grad_norm_inspection"] = {
+        "enabled": True,
+        "granularity": "off",
+    }
+    train_path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ConfigError, match="grad_norm_inspection"):
+        load_train_config(train_path)
+
+
+def test_grad_norm_inspection_unknown_key_rejected(tmp_path):
+    train_path = _write_train_pair(tmp_path)
+    data = yaml.safe_load(train_path.read_text())
+    data["logging"]["grad_norm_inspection"] = {
+        "enabled": True,
+        "granularity": "group",
+        "log_every": 25,          # removed field; must be rejected as unknown
+    }
+    train_path.write_text(yaml.safe_dump(data))
+    with pytest.raises(UnknownKeyError):
+        load_train_config(train_path)
+
+
+def test_shipped_ar_dit_cond_configs_have_grad_norm_enabled():
+    """Q4 decision: default-on across all four training configs.  If a
+    future edit drifts one of them back to disabled by accident, this
+    test flags it before it lands."""
+    for cfg_path in (
+        PROJECT_ROOT / "configs/train/cifar10_train.yaml",
+        PROJECT_ROOT / "configs/train/cifar10_ar_dit_train.yaml",
+        PROJECT_ROOT / "configs/train/cifar10_ar_dit_cond_s2_train.yaml",
+        PROJECT_ROOT / "configs/train/cifar10_ar_dit_cond_xl2_train.yaml",
+    ):
+        t = load_train_config(cfg_path)
+        assert t.logging.grad_norm_inspection.enabled is True, cfg_path
+        assert t.logging.grad_norm_inspection.granularity == "group", cfg_path

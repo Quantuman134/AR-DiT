@@ -95,3 +95,20 @@ logging:
     entity: null            # null = personal account
     token_path: secrets/wandb.token
     mode: online            # online | offline | disabled
+  # ---- Gradient-norm inspection ----
+  # Emit per-parameter-group grad L2 norms to wandb on every
+  # ``train.log_interval`` step, into three collapsible sections:
+  #     grad_norm/       -> the global scalar (`total`)
+  #     grad_norm_group/ -> per-parameter-family scalars (~11 lines,
+  #                         including E1-specific t_query_trunk, W_msa,
+  #                         W_mlp so the zero-init dam unfreezing is
+  #                         directly observable)
+  #     grad_norm_block/ -> per-block breakdown (only if granularity=block)
+  # Turned on by default across all four DiT-family training configs so
+  # every run leaves an audit trail for the zero-init cascade.  See
+  # utils/grad_norm.py for the group taxonomy and doc/AR_DiT.md §9a for
+  # the ARDiTCond-specific waterfall these numbers make legible.
+  grad_norm_inspection:
+    enabled: true
+    granularity: group      # off | global | group | block
+

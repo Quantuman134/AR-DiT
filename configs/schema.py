@@ -59,6 +59,12 @@ _LR_SCHEDULES = ("constant", "cosine")
 _AMP_DTYPES = ("fp32", "bf16")
 _WANDB_MODES = ("online", "offline", "disabled")
 _DATASET_NAMES = ("cifar10",)
+#: Granularity levels for ``LoggingConfig.grad_norm_inspection``.
+#: Kept in sync with ``utils.grad_norm.GRAD_NORM_GRANULARITIES`` — this
+#: duplication is intentional to avoid a schema -> utils import cycle at
+#: config-load time (the schema is imported by tests that must run
+#: without torch).
+_GRAD_NORM_GRANULARITIES = ("off", "global", "group", "block")
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +267,44 @@ class WandbConfig:
 
 
 @dataclass(frozen=True)
+class GradNormConfig:
+    """Gradient-norm inspection controls (training only).
+
+    See ``utils/grad_norm.py`` for the actual measurement logic and the
+    wandb-key layout.  Off by default at the dataclass level so that
+    forgetting to set the field in a YAML is safe (zero runtime cost,
+    zero wandb-panel change).
+
+    Logging cadence is intentionally *not* a field: the report is
+    emitted on the same steps as the other ``train/*`` metrics
+    (governed by ``train.log_interval``).  This keeps the wandb
+    step-index aligned across all training scalars — no jagged
+    per-metric x-axes — and removes a foot-gun where a finer
+    grad-norm cadence would silently do nothing because the wandb
+    log-site only fires every ``log_interval`` steps anyway.
+    """
+    enabled: bool = False
+    granularity: str = "group"       # off | global | group | block
+
+    def __post_init__(self) -> None:
+        if self.granularity not in _GRAD_NORM_GRANULARITIES:
+            raise ConfigError(
+                f"logging.grad_norm_inspection.granularity={self.granularity!r} "
+                f"not in {_GRAD_NORM_GRANULARITIES}"
+            )
+        if self.enabled and self.granularity == "off":
+            raise ConfigError(
+                "logging.grad_norm_inspection: enabled=true is inconsistent with "
+                "granularity='off'; set enabled=false or pick a non-'off' granularity."
+            )
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     out_dir: str
     run_name: str
     wandb: WandbConfig
+    grad_norm_inspection: GradNormConfig = field(default_factory=GradNormConfig)
 
 
 @dataclass(frozen=True)
@@ -576,6 +616,7 @@ __all__ = [
     "MetricsConfig",
     "ValidationConfig",
     "WandbConfig",
+    "GradNormConfig",
     "LoggingConfig",
     "TrainConfig",
     "SamplingConfig",

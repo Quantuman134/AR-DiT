@@ -73,6 +73,7 @@ from runtime import (
     setup_distributed,
     snapshot_rng,
 )
+from utils.grad_norm import compute_grad_norm_report
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +708,14 @@ def train(cfg: TrainConfig, resume_path: str | None) -> None:
     grad_accum = cfg.train.grad_accum_steps
     log_interval = cfg.train.log_interval
 
+    # Gradient-norm inspection.  Report cadence is intentionally tied
+    # to ``log_interval`` (see GradNormConfig docstring for the design
+    # rationale) — we compute the report exactly on steps where the
+    # wandb payload will be emitted, so nothing is measured and then
+    # thrown away.
+    gn_cfg = cfg.logging.grad_norm_inspection
+    gn_enabled = gn_cfg.enabled and gn_cfg.granularity != "off"
+
     # Rolling stats for terminal / wandb scalars.  The ``log_`` prefix
     # marks these as logging-only state: they never feed back into
     # training (loss.backward, optimiser.step, EMA update, checkpoint,
@@ -768,6 +777,27 @@ def train(cfg: TrainConfig, resume_path: str | None) -> None:
                     params, max_norm=cfg.optim.grad_clip
                 )
 
+            # Gradient-norm inspection (rank 0 only, pre-``optimizer.step()``
+            # so grads are still populated, and cadence-locked to the
+            # wandb log-site — we only pay the reduction cost on steps
+            # where the report will actually be logged.  Doing it after
+            # ``clip_grad_norm_`` is fine: clipping rescales all params
+            # by the same factor, so *ratios* between groups — which is
+            # what this report is useful for — are preserved.  Absolute
+            # magnitudes are therefore post-clip; consistent with the
+            # existing ``train/grad_norm`` scalar which is also post-clip.
+            gn_report: dict[str, float] | None = None
+            if is_main and gn_enabled:
+                upcoming_step = step + 1
+                if (
+                    upcoming_step % log_interval == 0
+                    or upcoming_step == cfg.train.total_steps
+                ):
+                    gn_report = compute_grad_norm_report(
+                        online_module,
+                        granularity=gn_cfg.granularity,
+                    )
+
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -803,17 +833,22 @@ def train(cfg: TrainConfig, resume_path: str | None) -> None:
                     flush=True,
                 )
                 if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "train/loss": log_smoothed_loss,
-                            "train/lr": lr,
-                            "train/grad_norm": gn,
-                            "train/sec_per_step": log_smoothed_iter_time,
-                            "train/samples_per_sec": samples_per_sec,
-                            "train/epoch": sampler.epoch,
-                        },
-                        step=step,
-                    )
+                    wandb_payload = {
+                        "train/loss": log_smoothed_loss,
+                        "train/lr": lr,
+                        "train/grad_norm": gn,
+                        "train/sec_per_step": log_smoothed_iter_time,
+                        "train/samples_per_sec": samples_per_sec,
+                        "train/epoch": sampler.epoch,
+                    }
+                    # Merge gradient-norm inspection report if we
+                    # computed one this iteration.  Keys are already
+                    # namespaced (grad_norm/* / grad_norm_group/* /
+                    # grad_norm_block/*) so wandb renders them in
+                    # dedicated sections.
+                    if gn_report is not None:
+                        wandb_payload.update(gn_report)
+                    wandb_run.log(wandb_payload, step=step)
 
             # Validation — every rank participates.  The metrics are
             # collective (sync_on_compute=True), and each rank generates
