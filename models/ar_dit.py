@@ -80,7 +80,14 @@ class AttnResJunction(nn.Module):
     --------------------
     ``w`` : shape ``[D]``, initialised to zero (paper §5 — the sole stable
         initialisation, gives an equal-weight average at step 0).
-    ``rms.weight`` : shape ``[D]``, RMSNorm scale, initialised to 1.
+    ``rms.weight`` : shape ``[D]``, key-path RMSNorm scale, initialised
+        to 1.
+    ``q_rms.weight`` : shape ``[D]``, query-path RMSNorm scale,
+        initialised to 1. **Used only when ``q_override`` is provided**
+        (the E1 / ARDiTCond path); the paper-strict v1 branch (``q =
+        self.w``) bypasses it entirely, since ``self.w`` is bounded by
+        its own optimiser updates and RMSNorm on a zero-init constant
+        would be numerically ill-conditioned.
 
     Notes
     -----
@@ -88,8 +95,22 @@ class AttnResJunction(nn.Module):
       not over the token axis. Each ``(b, n)`` slice is normalised
       independently.
     * No ``1/sqrt(D)`` scaling: the paper's kernel is unscaled and
-      RMSNorm already bounds the key-side magnitude (see doc/AR_DiT.md
-      §4).
+      RMSNorm bounds the argument magnitudes to O(1) on both the key
+      and (in the ``q_override`` branch) query sides.
+    * **Query-side RMSNorm asymmetry** — the v1 branch uses the raw
+      learned ``self.w`` un-normed; the E1 branch normalises
+      ``q_override``. This asymmetry is deliberate: v1's ``w`` is a
+      global constant whose magnitude is fully controlled by the
+      optimiser, so it never runs away. E1's ``q_override =
+      W_l(tau) + w`` is a per-image quantity produced by an upstream
+      linear head whose weight matrix ``W_l`` can grow unboundedly
+      during training, driving ``|q · RMSNorm(k)|`` into softmax
+      saturation (one-hot attention → zero backprop through the
+      kernel → the E1 query-path parameter group dies at exactly zero
+      gradient). ``q_rms`` structurally prevents that failure by
+      capping the query magnitude to O(1). See doc/AR_DiT.md §9a and
+      the `fix/e1-q-rmsnorm-softmax-saturation` diagnosis for the observed
+      failure mode this addresses.
     """
 
     def __init__(self, hidden_size: int):
@@ -100,6 +121,12 @@ class AttnResJunction(nn.Module):
         # Per-junction RMSNorm applied INSIDE the kernel to the key path.
         # nn.RMSNorm(dim) initialises the learnable scale to 1 by default.
         self.rms = nn.RMSNorm(hidden_size)
+        # Per-junction RMSNorm applied INSIDE the kernel to the QUERY
+        # path — symmetric with ``self.rms``.  Consumed only in the
+        # ``q_override`` branch of ``forward`` (E1 / ARDiTCond); the v1
+        # branch bypasses it, so on paper-strict AR-DiT this parameter
+        # exists but sees zero gradient and stays at its init.
+        self.q_rms = nn.RMSNorm(hidden_size)
 
     def forward(
         self,
@@ -141,10 +168,19 @@ class AttnResJunction(nn.Module):
         #   * v1 (q_override is None): q = self.w  of shape [D].
         #     Same query for every image in the batch — a global
         #     constant. einsum contracts the model dim ``d`` only.
-        #   * E1 (q_override provided): q = q_override of shape [B, D].
-        #     Per-image query — different images get different logit
-        #     distributions. einsum contracts the model dim ``d`` while
-        #     broadcasting the batch dim ``b``. See doc/AR_DiT.md §9a.6.
+        #     ``self.w`` is used un-normed: it is bounded by the
+        #     optimiser directly and RMSNorm on a zero-init vector
+        #     would be ill-conditioned (0 / sqrt(eps) at step 0).
+        #   * E1 (q_override provided): q = RMSNorm(q_override) of
+        #     shape [B, D].  Per-image query — different images get
+        #     different logit distributions.  Query-side RMSNorm is
+        #     applied here, symmetric with the key-side ``self.rms``,
+        #     so the kernel is ``phi(q, k) = exp(RMSNorm(q) .
+        #     RMSNorm(k))``.  This bounds ``|logit|`` to O(1) even
+        #     when upstream ``W_l`` grows, preventing the softmax
+        #     saturation failure documented in doc/TO_FIX.md.
+        #     einsum contracts the model dim ``d`` while broadcasting
+        #     the batch dim ``b``.  See doc/AR_DiT.md §9a.6.
         # logits: [B, N, l] in both branches.
         if q_override is None:
             logits = torch.einsum("d,bnld->bnl", self.w, keys_normed)
@@ -153,7 +189,8 @@ class AttnResJunction(nn.Module):
                 f"AttnResJunction: q_override must have shape [B, D={self.hidden_size}]; "
                 f"got {tuple(q_override.shape)}."
             )
-            logits = torch.einsum("bd,bnld->bnl", q_override, keys_normed)
+            q_normed = self.q_rms(q_override)
+            logits = torch.einsum("bd,bnld->bnl", q_normed, keys_normed)
 
         # Softmax over the source axis (length l).
         # alpha: [B, N, l]
@@ -199,7 +236,11 @@ class ARDiTBlock(nn.Module):
     Learnable parameters
     --------------------
     Everything from :class:`DiTBlock` (norms are non-affine so contribute
-    nothing) plus the two junctions' ``(w, rms.weight)`` pairs.
+    nothing) plus the two junctions' ``(w, rms.weight, q_rms.weight)``
+    triples. ``q_rms`` sees no gradient on this paper-strict AR-DiT
+    path (it is used only when ``q_override`` is passed, which
+    :class:`ARDiTBlock` never does); it exists on the module for a
+    uniform state-dict shape shared with :class:`ARDiTCondBlock`.
     """
 
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):

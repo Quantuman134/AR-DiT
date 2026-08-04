@@ -168,20 +168,28 @@ def test_ar_dit_zero_init_internal_scaling():
 # ---------------------------------------------------------------------------
 
 def test_ar_dit_param_count_diff():
-    """Params(ARDiT) - Params(DiT) == 2L * 2 * D exactly.
+    """Params(ARDiT) - Params(DiT) == 2L * 3 * D exactly.
 
-    Breakdown (doc §4):
+    Breakdown (doc §4, updated for the symmetric-kernel fix in
+    ``fix/e1-q-rmsnorm-softmax-saturation``):
 
-    * 2L pseudo-queries of size D  → 2L·D scalars
-    * 2L RMSNorm scales of size D  → 2L·D scalars
-    * Total added                   → 2L · 2 · D scalars
+    * 2L pseudo-queries ``w`` of size D           → 2L·D scalars
+    * 2L key-path RMSNorm scales ``rms`` of D     → 2L·D scalars
+    * 2L query-path RMSNorm scales ``q_rms`` of D → 2L·D scalars
+    * Total added                                  → 2L · 3 · D scalars
+
+    The ``q_rms`` scale is dormant on paper-strict AR-DiT (the
+    ``q_override`` branch of :class:`AttnResJunction` is never taken
+    here), but it lives on the module for a uniform state-dict shape
+    shared with :class:`ARDiTCond`; the smoke test below verifies
+    that dormancy explicitly.
     """
     ar = ARDiT(**_MODEL_KWARGS)
     dit = DiT(**_MODEL_KWARGS)
     n_ar = sum(p.numel() for p in ar.parameters())
     n_dit = sum(p.numel() for p in dit.parameters())
     L, D = _MODEL_KWARGS["depth"], _MODEL_KWARGS["hidden_size"]
-    assert n_ar - n_dit == 2 * L * 2 * D
+    assert n_ar - n_dit == 2 * L * 3 * D
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +198,10 @@ def test_ar_dit_param_count_diff():
 
 def test_ar_dit_smoke_roundtrip():
     """Full forward + MSE loss + backward. No NaN; every trainable
-    parameter receives a gradient.
+    parameter receives a gradient **except the dormant ``q_rms``
+    scales**, which live on the module for state-dict compatibility
+    with :class:`ARDiTCond` but are never touched by the paper-strict
+    ``q_override is None`` code path.
 
     Runs in train mode (with class dropout still off in ``_MODEL_KWARGS``
     to keep the test deterministic) so LayerNorm/adaLN paths that
@@ -207,6 +218,14 @@ def test_ar_dit_smoke_roundtrip():
 
     assert torch.isfinite(loss)
     for name, p in model.named_parameters():
+        # ``q_rms`` is exercised only on the ``q_override`` branch
+        # (ARDiTCond); AR-DiT never routes gradient through it.
+        if ".q_rms." in name:
+            assert p.grad is None, (
+                f"{name} unexpectedly received gradient on the v1 "
+                "(q_override is None) code path"
+            )
+            continue
         assert p.grad is not None, f"{name} has no gradient"
         assert torch.isfinite(p.grad).all(), f"{name} has non-finite gradient"
 
