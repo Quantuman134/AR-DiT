@@ -13,7 +13,10 @@ only in a small set of E1-specific tensors.  A single regex table
 *   Plain DiT: patch/timestep/label embedders, per-block attn/mlp/adaLN,
     final layer.
 *   AR-DiT: the above + per-block ``attn_res_msa`` / ``attn_res_mlp``
-    (each with a zero-init ``.w`` and a learnable RMSNorm scale).
+    (each with a zero-init ``.w``, a key-path RMSNorm scale ``.rms``,
+    and a query-path RMSNorm scale ``.q_rms``; on paper-strict AR-DiT
+    the ``.q_rms`` group sees no gradient because the ``q_override``
+    branch is never taken).
 *   ARDiTCond (E1): the above + the shared ``t_query_trunk`` MLP and the
     per-block per-junction heads ``W_msa`` / ``W_mlp``.
 
@@ -90,13 +93,18 @@ GROUP_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("blocks.mlp",            re.compile(r"^blocks\.\d+\.mlp\.")),
     ("blocks.adaLN",          re.compile(r"^blocks\.\d+\.adaLN_modulation\.")),
     # AR-DiT / ARDiTCond junctions.  ``.w`` is the pseudo-query
-    # (zero-init in AR-DiT, bypassed in ARDiTCond); ``.rms`` is the
-    # in-kernel RMSNorm scale (one-init).  Split into two groups so
-    # each can be watched independently.
+    # (zero-init in AR-DiT, additive bias in ARDiTCond); ``.rms`` is
+    # the in-kernel key-path RMSNorm scale (one-init); ``.q_rms`` is
+    # the in-kernel query-path RMSNorm scale (one-init), consumed only
+    # on the ARDiTCond ``q_override`` branch and therefore expected to
+    # be identically zero on paper-strict AR-DiT.  Split into separate
+    # groups so each can be watched independently.
     ("blocks.attn_res_msa.w",     re.compile(r"^blocks\.\d+\.attn_res_msa\.w$")),
     ("blocks.attn_res_mlp.w",     re.compile(r"^blocks\.\d+\.attn_res_mlp\.w$")),
     ("blocks.attn_res_msa.rms",   re.compile(r"^blocks\.\d+\.attn_res_msa\.rms\.")),
     ("blocks.attn_res_mlp.rms",   re.compile(r"^blocks\.\d+\.attn_res_mlp\.rms\.")),
+    ("blocks.attn_res_msa.q_rms", re.compile(r"^blocks\.\d+\.attn_res_msa\.q_rms\.")),
+    ("blocks.attn_res_mlp.q_rms", re.compile(r"^blocks\.\d+\.attn_res_mlp\.q_rms\.")),
     # ARDiTCond-only per-junction linear heads (E1).  Absent on DiT /
     # AR-DiT.  Zero-init — the last dam in the E1 waterfall.
     ("blocks.W_msa",          re.compile(r"^blocks\.\d+\.W_msa\.")),

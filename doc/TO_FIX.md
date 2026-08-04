@@ -121,4 +121,86 @@ is intended to grow; it is the project's institutional memory of
 "what looked broken, what turned out to be the real problem, and how
 we fixed it".
 
-*(none yet)*
+### E1 (ARDiTCond) training collapses to random-noise-tier FID at ~800k steps
+- **Discovered on**: `feature/grad-norm-inspection` — 2026-08-01
+- **Symptom**:
+  ARDiTCond XL/2 on CIFAR-10 trained to 800k steps produced
+  FID-50K ≈ **300** vs. AR-DiT baseline's FID ≈ 10 at the equivalent
+  step budget (i.e. samples were near-pure noise). Per-parameter-group
+  gradient-norm logging (introduced by this very branch, ironically)
+  revealed that at **step ≈ 750** the query-path parameter groups
+  collapsed simultaneously: `blocks.attn_res_msa.w`,
+  `blocks.attn_res_mlp.w`, `blocks.attn_res_msa.rms`,
+  `blocks.attn_res_mlp.rms`, `blocks.attn`, `blocks.W_msa`,
+  `blocks.W_mlp`, and `t_query_trunk` all dropped from O(1e-1) to
+  **exactly 0.0** within one logging interval and stayed there for the
+  remaining ~77k logged steps (95–98 % zero-fraction). Meanwhile
+  `blocks.mlp`, `blocks.adaLN`, `final_layer`, `patch_embed`,
+  `t_embedder`, `y_embedder` stayed healthy throughout — a very
+  specific *"gradient dies on the softmax-kernel path but not on the
+  additive-residual path"* fingerprint.
+- **Reproduce**:
+  - CSVs preserved at [`tmp/wandb_export_2026-08-01T02_*.csv`](/home/hongkun/Attention_Residual_for_DiT/tmp).
+  - Diagnostic summariser: [`tmp/_diag.py`](/home/hongkun/Attention_Residual_for_DiT/tmp/_diag.py).
+  - Full write-up with plots + inference chain: [`tmp/ardit_cond_diagnosis.html`](/home/hongkun/Attention_Residual_for_DiT/tmp/ardit_cond_diagnosis.html).
+- **Root cause (so far)**: The E1 kernel evaluates
+  `logit = q_override · RMSNorm(k)` with **no bound on `‖q_override‖`**.
+  Since `q_override = W_msa(tau) + w` where `W_msa` is a learned
+  linear whose spectral norm grows unbounded during training,
+  `|logit|` can grow into the range where softmax saturates to a
+  one-hot distribution. At that point `∂α/∂logit ≈ 0`, so all upstream
+  parameters that produced `q_override` (trunk → W_msa/W_mlp → w) —
+  plus the key-side `RMSNorm` scale that shares the same jacobian —
+  receive numerically-zero gradient and stay frozen forever. The
+  v1 (AR-DiT) branch is immune because `q = self.w` is a single
+  learned D-vector whose magnitude is controlled directly by the
+  optimiser and never runs away.
+- **Proposed fix**: three options considered —
+  - **(a)** Add `1/√D` scaling to the E1 kernel path only. Cheapest
+    change (one line, no new params), but bounds only the *initial*
+    logit magnitude — `‖W_msa‖` could still grow ~34× and re-enter
+    saturation later in a longer run.
+  - **(b)** Add an in-kernel `nn.RMSNorm(D)` on the query path,
+    symmetric with the existing one on the key path. Structurally
+    caps `‖q‖` to O(1) forever, at the cost of D scalars per junction
+    (~64k new params on XL/2, 0.014 % of the model).
+  - **(c)** Both (a) and (b). Redundant.
+- **Blocking?**: **Yes** — every E1 experiment beyond ~1k steps is
+  invalidated until this lands.
+- **Owner**: fixed on this branch (`fix/e1-q-rmsnorm-softmax-saturation`).
+- **Resolution**:
+    - **Fixed on**: `fix/e1-q-rmsnorm-softmax-saturation` @ (this commit) — 2026-08-04
+    - **Actual root cause**: exactly as diagnosed above —
+      unbounded `‖q_override‖` driving softmax saturation. The
+      "dying groups vs. surviving groups" partition matched a
+      saturated-softmax cutoff exactly: everything whose gradient
+      passes through `α = softmax(q · RMSNorm(k))` dies; everything
+      that reaches the loss via an additive residual survives.
+    - **Chosen fix**: **Option (b)** — a per-junction
+      `nn.RMSNorm(hidden_size)` (attribute name `q_rms`) added to
+      `AttnResJunction`, applied inside the kernel on the
+      `q_override` branch. The v1 branch (`q_override is None`) is
+      left byte-identical: it still consumes the raw learned
+      `self.w` un-normed, since `self.w` is bounded by the optimiser
+      and RMSNorm-of-zero at init would be numerically undefined.
+      This makes the E1 kernel
+      `ϕ(q, k) = exp(RMSNorm(q) · RMSNorm(k))` — symmetric in its
+      arguments and O(1)-bounded in the logit no matter how far the
+      upstream `W_msa` weights drift. Option (a) was rejected as
+      symptom-mitigation rather than a structural cure; option (c)
+      as unnecessary belt-and-braces once (b) is in.
+    - **Regression coverage**:
+      - `tests/test_ar_dit.py::test_ar_dit_smoke_roundtrip` now
+        asserts `q_rms.grad is None` on the paper-strict AR-DiT
+        code path (dormancy invariant).
+      - `tests/test_ar_dit.py::test_ar_dit_param_count_diff` now
+        expects `2L · 3 · D` extra params (was `2L · 2 · D`) —
+        catches accidental removal of the new module.
+      - `tests/test_components.py::test_ar_dit_block_grad_flow` and
+        `test_ar_dit_block_paramcount_vs_dit_block` updated
+        symmetrically at block granularity.
+      - Per-group gradient logging (from the parent branch) already
+        provides live monitoring: a recurrence would show up as
+        `blocks.attn_res_*.q_rms` moving away from an all-ones
+        scale, or a sudden drop of any query-path group's grad-norm
+        to exactly 0 in wandb.

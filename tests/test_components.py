@@ -488,6 +488,14 @@ def test_ar_dit_block_grad_flow():
     Uses non-zero adaLN and non-zero pseudo-queries so both AttnRes
     junctions and both sub-layers are in a "trained" regime — this is
     the practically relevant grad-flow check.
+
+    Note on ``q_rms``: on the paper-strict AR-DiT block, the
+    ``q_override`` branch of :class:`AttnResJunction` is never taken,
+    so ``q_rms.weight`` sits off the backward graph and its
+    ``.grad`` stays ``None`` here. That dormancy is a documented
+    invariant of :class:`ARDiTBlock` (the parameter exists only for
+    state-dict compatibility with :class:`ARDiTCondBlock`) and is
+    asserted explicitly below.
     """
     torch.manual_seed(0)
     block = ARDiTBlock(hidden_size=32, num_heads=4)
@@ -500,13 +508,25 @@ def test_ar_dit_block_grad_flow():
     out = block(x, c, cache)
     out.sum().backward()
     for name, p in block.named_parameters():
+        if ".q_rms." in name:
+            assert p.grad is None, (
+                f"{name} unexpectedly received gradient on the v1 "
+                "(q_override is None) code path"
+            )
+            continue
         assert p.grad is not None, f"{name} has no gradient"
         assert torch.isfinite(p.grad).all(), f"{name} has non-finite gradient"
 
 
 def test_ar_dit_block_paramcount_vs_dit_block():
-    """AR-DiT block adds exactly ``4 * D`` learnable scalars over baseline DiT
-    (two junctions × two vectors of length D each: ``w`` and ``rms.weight``).
+    """AR-DiT block adds exactly ``6 * D`` learnable scalars over baseline DiT.
+
+    Per junction the AttnRes overhead is three D-vectors:
+    ``w`` (pseudo-query), ``rms.weight`` (key-path RMSNorm scale),
+    and ``q_rms.weight`` (query-path RMSNorm scale — dormant on this
+    paper-strict block but present for state-dict compatibility with
+    :class:`ARDiTCondBlock`). With two junctions per block:
+    ``2 junctions × 3 vectors × D = 6D`` extra scalars.
     """
     D, H = 32, 4
     ar_block = ARDiTBlock(hidden_size=D, num_heads=H)
@@ -514,4 +534,4 @@ def test_ar_dit_block_paramcount_vs_dit_block():
     diff = sum(p.numel() for p in ar_block.parameters()) - sum(
         p.numel() for p in dit_block.parameters()
     )
-    assert diff == 4 * D
+    assert diff == 6 * D
