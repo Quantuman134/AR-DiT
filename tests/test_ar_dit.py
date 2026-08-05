@@ -420,9 +420,25 @@ def test_ardit_cond_time_dependence():
 
     # Break q_l ≡ 0 in the LAST junction, and unmute FinalLayer.
     # Perturbation scale 1.0 chosen because 0.1 produces a signal
-    # ``~ 1e-5`` — within numerical noise; 1.0 gives a signal
-    # ``~ 1e-1`` at DiT-tiny scale — well above any plausible noise
-    # floor without saturating softmax logits.
+    # ``~ 1e-5`` — within numerical noise; 1.0 gives a signal well
+    # above the tolerance floor without saturating softmax logits.
+    #
+    # Note on signal magnitude — after
+    # `fix/e1-attn-scale-sqrt-d` introduced the ``1 / sqrt(D)`` scaled
+    # dot-product factor on the ``q_override`` branch, the maximum
+    # signal at this setup drops from ~7e-1 to ~3e-4. Two mechanisms
+    # collaborate to shrink it and neither can be undone by scaling
+    # the perturbation:
+    #   * ``RMSNorm(q_override)`` is scale-invariant on the vector
+    #     magnitude, so ``||RMSNorm(q)|| = sqrt(D)`` regardless of
+    #     ``W_mlp`` magnitude — only the direction of ``q_override``
+    #     depends on ``t``.
+    #   * The ``1 / sqrt(D)`` factor caps the softmax argument at
+    #     ``||RMSNorm(q)|| * ||RMSNorm(k)|| / sqrt(D) = sqrt(D)``
+    #     (well below saturation for D=32), which is by design.
+    # The residual signal ~3e-4 is still >>100× above fp32 numerical
+    # noise, so it remains a valid detector of "E1 code path silently
+    # unreachable" — that regression would give delta bit-exactly 0.
     D = _MODEL_KWARGS["hidden_size"]
     with torch.no_grad():
         model.blocks[-1].W_mlp.weight.copy_(torch.randn(D, D) * 1.0)
@@ -439,11 +455,13 @@ def test_ardit_cond_time_dependence():
         out_lo = model(x, t_lo, y)
         out_hi = model(x, t_hi, y)
 
-    # Outputs must differ substantially — modest tolerance floor of
-    # 1e-2 to reject a near-zero delta that would indicate the E1 path
-    # is silently unreachable. Observed signal at this setup: ~7e-1.
+    # Outputs must differ substantially above numerical noise —
+    # tolerance floor 1e-5 (>>100× fp32 rel-err at these output
+    # magnitudes) rejects a near-zero delta that would indicate the
+    # E1 path is silently unreachable. Observed signal at this setup:
+    # ~3e-4 (post-`fix/e1-attn-scale-sqrt-d`).
     delta = (out_hi - out_lo).abs().max().item()
-    assert delta > 1e-2, (
+    assert delta > 1e-5, (
         f"ARDiTCond output does not depend on t via the AttnRes path "
         f"(max |Δoutput| = {delta:.3e}). Suspect: q_override branch of "
         f"AttnResJunction not exercised, or W_mlp change did not propagate."

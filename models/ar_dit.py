@@ -94,9 +94,21 @@ class AttnResJunction(nn.Module):
     * The softmax is over the **source-junction axis** of length ``l``,
       not over the token axis. Each ``(b, n)`` slice is normalised
       independently.
-    * No ``1/sqrt(D)`` scaling: the paper's kernel is unscaled and
-      RMSNorm bounds the argument magnitudes to O(1) on both the key
-      and (in the ``q_override`` branch) query sides.
+    * **``1/sqrt(D)`` scaling — E1 branch only.** The ``q_override``
+      branch multiplies the dot-product logit by ``1 / sqrt(D)``,
+      matching standard scaled-dot-product attention. Even with
+      RMSNorm on both q and k, each RMSNormed vector has L2 norm
+      ``sqrt(D)`` (RMSNorm rescales the per-element RMS to 1, not the
+      full norm), so an un-scaled dot product has magnitude
+      ``O(D * rms_q_weight * rms_k_weight)`` — dimensionally large
+      and unbounded in the learnable RMSNorm weights. The
+      ``1/sqrt(D)`` factor cancels the dimensional-sum growth,
+      leaving the softmax argument at ``O(rms_q_weight *
+      rms_k_weight)``. The v1 branch (``q = self.w``) intentionally
+      omits this scaling — ``self.w`` is zero-init and
+      weight-decayed, so its magnitude is small by construction and
+      the paper's original unscaled formulation is preserved bit-
+      for-bit.
     * **Query-side RMSNorm asymmetry** — the v1 branch uses the raw
       learned ``self.w`` un-normed; the E1 branch normalises
       ``q_override``. This asymmetry is deliberate: v1's ``w`` is a
@@ -107,10 +119,14 @@ class AttnResJunction(nn.Module):
       during training, driving ``|q · RMSNorm(k)|`` into softmax
       saturation (one-hot attention → zero backprop through the
       kernel → the E1 query-path parameter group dies at exactly zero
-      gradient). ``q_rms`` structurally prevents that failure by
-      capping the query magnitude to O(1). See doc/AR_DiT.md §9a and
-      the `fix/e1-q-rmsnorm-softmax-saturation` diagnosis for the observed
-      failure mode this addresses.
+      gradient). ``q_rms`` structurally prevents the vector-norm
+      component of that failure by bounding ``||RMSNorm(q)|| =
+      sqrt(D) * rms_q_weight``; the ``1/sqrt(D)`` scaling
+      additionally kills the dimensional-sum factor. See
+      doc/AR_DiT.md §9a, the `fix/e1-q-rmsnorm-softmax-saturation`
+      diagnosis for the RMSNorm addition, and
+      `fix/e1-attn-scale-sqrt-d` for the dimensional-scaling
+      addition.
     """
 
     def __init__(self, hidden_size: int):
@@ -168,19 +184,32 @@ class AttnResJunction(nn.Module):
         #   * v1 (q_override is None): q = self.w  of shape [D].
         #     Same query for every image in the batch — a global
         #     constant. einsum contracts the model dim ``d`` only.
-        #     ``self.w`` is used un-normed: it is bounded by the
-        #     optimiser directly and RMSNorm on a zero-init vector
-        #     would be ill-conditioned (0 / sqrt(eps) at step 0).
+        #     ``self.w`` is used un-normed and un-scaled: it is
+        #     bounded by the optimiser directly (zero-init +
+        #     weight-decay), and RMSNorm on a zero-init vector would
+        #     be ill-conditioned (0 / sqrt(eps) at step 0). Preserves
+        #     paper-strict AR-DiT bit-for-bit.
         #   * E1 (q_override provided): q = RMSNorm(q_override) of
         #     shape [B, D].  Per-image query — different images get
         #     different logit distributions.  Query-side RMSNorm is
         #     applied here, symmetric with the key-side ``self.rms``,
-        #     so the kernel is ``phi(q, k) = exp(RMSNorm(q) .
-        #     RMSNorm(k))``.  This bounds ``|logit|`` to O(1) even
-        #     when upstream ``W_l`` grows, preventing the softmax
-        #     saturation failure documented in doc/TO_FIX.md.
+        #     and the logit is additionally rescaled by
+        #     ``1 / sqrt(D)`` (standard scaled-dot-product attention).
+        #     Rationale — two-part defense against softmax saturation:
+        #       (a) RMSNorm bounds each vector's L2 norm to
+        #           ``sqrt(D) * rms_weight`` (RMSNorm rescales per-
+        #           element RMS to 1, so ||x|| = sqrt(D) when weight
+        #           is 1). Without (a), upstream ``W_l`` growth would
+        #           blow up ``||q||`` unboundedly.
+        #       (b) ``1/sqrt(D)`` cancels the dimensional-sum growth
+        #           of the D-term dot product: q . k with
+        #           ||q|| = ||k|| = sqrt(D) has raw magnitude ~D, so
+        #           scaling by 1/sqrt(D) leaves the softmax argument
+        #           at O(1) w.r.t. hidden size.
+        #     Together, the kernel is
+        #       phi(q, k) = exp( RMSNorm(q) . RMSNorm(k) / sqrt(D) ).
         #     einsum contracts the model dim ``d`` while broadcasting
-        #     the batch dim ``b``.  See doc/AR_DiT.md §9a.6.
+        #     the batch dim ``b``. See doc/AR_DiT.md §9a.6.
         # logits: [B, N, l] in both branches.
         if q_override is None:
             logits = torch.einsum("d,bnld->bnl", self.w, keys_normed)
@@ -190,7 +219,10 @@ class AttnResJunction(nn.Module):
                 f"got {tuple(q_override.shape)}."
             )
             q_normed = self.q_rms(q_override)
-            logits = torch.einsum("bd,bnld->bnl", q_normed, keys_normed)
+            # Scaled-dot-product attention: divide by sqrt(D) to keep
+            # the softmax argument at O(1) w.r.t. hidden size.
+            scale = 1.0 / math.sqrt(self.hidden_size)
+            logits = torch.einsum("bd,bnld->bnl", q_normed, keys_normed) * scale
 
         # Softmax over the source axis (length l).
         # alpha: [B, N, l]
