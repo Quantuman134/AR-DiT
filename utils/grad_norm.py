@@ -19,6 +19,12 @@ only in a small set of E1-specific tensors.  A single regex table
     branch is never taken).
 *   ARDiTCond (E1): the above + the shared ``t_query_trunk`` MLP and the
     per-block per-junction heads ``W_msa`` / ``W_mlp``.
+*   ARDiTCondSANA (E2): AR-DiT + the depth-shared time-conditioned
+    query module ``time_cond_query`` (``w_attn``, ``w_mlp``, ``phi_attn``,
+    ``phi_mlp``).  E2 does **not** own per-block per-junction heads, and
+    its ``blocks.*.attn_res_*.w`` parameters are dormant (bypassed by
+    the ``q_override_raw`` code path), so those groups exist on the
+    model but see zero gradient.
 
 Groups whose regex matches nothing on a given model are simply omitted
 from the report (not logged as zero) — a zero would be misleading, as
@@ -109,6 +115,16 @@ GROUP_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # AR-DiT.  Zero-init — the last dam in the E1 waterfall.
     ("blocks.W_msa",          re.compile(r"^blocks\.\d+\.W_msa\.")),
     ("blocks.W_mlp",          re.compile(r"^blocks\.\d+\.W_mlp\.")),
+    # ARDiTCondSANA-only depth-shared time-conditioned query (E2).
+    # Absent on DiT / AR-DiT / ARDiTCond.  All four tensors zero-init
+    # — see doc/AR_DiT.md §9b.5.  Split into four groups so the two
+    # additive biases (``w_*``, small) and the two codebooks
+    # (``phi_*``, large) can be watched independently, mirroring the
+    # E1 split between ``t_query_trunk`` and per-junction heads.
+    ("sana_time_cond.w_attn",   re.compile(r"^time_cond_query\.w_attn$")),
+    ("sana_time_cond.w_mlp",    re.compile(r"^time_cond_query\.w_mlp$")),
+    ("sana_time_cond.phi_attn", re.compile(r"^time_cond_query\.phi_attn$")),
+    ("sana_time_cond.phi_mlp",  re.compile(r"^time_cond_query\.phi_mlp$")),
     ("final_layer",           re.compile(r"^final_layer\.")),
 )
 
