@@ -602,11 +602,21 @@ def train(cfg: TrainConfig, resume_path: str | None) -> None:
 
     # ---- DDP wrap ----
     if world_size > 1:
+        # find_unused_parameters=True: AttnResJunction owns parameters
+        # (self.w, self.q_rms) that are intentionally bypassed on the
+        # time-conditioned override paths (E1 `q_override` skips self.w;
+        # E2 `q_override_raw` skips both self.w and self.q_rms — see
+        # doc/AR_DiT.md §9a/§9b). Those params receive no gradient by
+        # design (they exist only for state-dict compatibility with the
+        # paper-strict v1 junction, whose forward *does* use self.w).
+        # Without this flag DDP's reducer raises "Expected to have
+        # finished reduction in the prior iteration" on the first step.
         online_net = DDP(
             online_net,
             device_ids=[local_rank] if device.type == "cuda" else None,
             output_device=local_rank if device.type == "cuda" else None,
             broadcast_buffers=False,
+            find_unused_parameters=True,
         )
     # `online_module` is the *unwrapped* nn.Module beneath any DDP wrap;
     # used wherever we need the raw parameters/buffers (EMA update, ckpt
