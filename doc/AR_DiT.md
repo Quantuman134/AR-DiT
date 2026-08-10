@@ -727,6 +727,202 @@ None of these are on E1's critical path.
 
 ---
 
+## 9b. E2 — SANA-time-conditioned pseudo-query (second implemented extension)
+
+§9b is **the second extension we implement**: it lifts entry E2 ("SANA
+time-conditioned pseudo-query") into a real, testable model. It is a
+deliberate, *minimal* contrast with E1 (§9a): instead of an MLP over
+`t_emb` that produces a continuous, depth-specialised query per
+junction, E2 uses **depth-shared** queries and a **discrete time
+codebook**. The name "SANA-time-cond" follows the SANA family's
+discrete, sampled-timestep conditioning convention (inference samples
+`t` at discrete steps, so a fixed-size learnable codebook indexed by
+`⌊t · B_time⌋` is a faithful model of that process).
+
+E2 leaves every other AttnRes design choice untouched — same 2L
+junctions (§3), same operator (§4), same per-patch weights (§6), same
+per-junction RMSNorm on the **key** (§7), same pre-residual value
+source (§8). The sole change is **where each junction's pseudo-query
+comes from**, and **how the kernel consumes it** (§9b.4).
+
+### 9b.1 Depth-shared query + discrete time codebook (core mechanism)
+
+v1 uses a constant per-junction pseudo-query `q_l = w_l`. E1 uses a
+continuous, junction-specific query `q_l = W_l · MLP_shared(t_emb) +
+w_l`. E2 replaces both with a **depth-shared, kind-specific** query
+that is the sum of a constant bias and a time codebook lookup:
+
+```
+q_m(t) = w_m + phi_m[ floor(t * num_time_bins) ]      # [B, D]
+```
+
+with
+
+- `m ∈ {attn, mlp}` — the junction *kind*. There are only **two**
+  query vectors in the whole network: `q_attn` drives every MHSA
+  junction at every depth, `q_mlp` drives every MLP junction at every
+  depth. (`w_m`, `phi_m` are indexed by `m`, not by depth.)
+- `w_m ∈ ℝ^D` — a **depth-shared, kind-specific** additive bias. One
+  `w_attn` and one `w_mlp` for the entire network (2 vectors total),
+  replacing v1's `2L` per-junction `w_l` vectors.
+- `phi_m ∈ ℝ^{B_time × D}` — the **time codebook**: `B_time`
+  learnable rows, one per discrete inference-time bin. With `t` sampled
+  on `[0, 1]` at `num_time_bins` steps (`0.0, 1/B_time, 2/B_time,
+  ...`), each sampled `t` maps to exactly one codebook row. Total of
+  `2 · B_time` rows (attn + mlp kinds).
+- `B_time = num_time_bins` — a config parameter (`num_time_bins`,
+  default `50`), **not** hardcoded. Named `num_time_bins` (not `T`)
+  to avoid clashing with the ubiquitous `T` = sequence length.
+
+**Parameter accounting.** New params vs v1 baseline = `2·D` (the two
+`w_m` vectors) + `2·B_time·D` (the two codebooks). At `B_time = 50`,
+`D = 384` (DiT-S/2): `2·384 + 100·384 = 39,168` ≈ **38.3 K** new
+params — roughly **0.1 %** of DiT-S/2's ~33 M. This is **an order of
+magnitude smaller** than E1's ~3.83 M (§9a.3); E2 trades E1's
+continuous expressiveness for a far cheaper, discrete conditioning.
+
+The query is **per-image** (`[B, D]`, one query per example in the
+batch), exactly like E1 — so the kernel still consumes a per-image
+query rather than v1's global constant. Concretely the logit einsum
+is
+
+```
+logits = einsum("bd, bnld -> bnl", q_m(t), keys_normed)     # E2
+```
+
+with `q_m(t) = w_m + phi_m[floor(t · B_time)]`.
+
+### 9b.2 Time quantisation — floor (fork decision)
+
+**Locked decision**: **floor** quantisation with clamping.
+
+```
+idx = clamp( floor(t * num_time_bins), 0, num_time_bins - 1 )
+```
+
+- Bin `i` covers `[i / num_time_bins, (i + 1) / num_time_bins)`.
+- `t = 0.0` → bin 0; `t = 1.0` (or any numerical overshoot just
+  above 1) → clamped to the **last** bin `num_time_bins - 1` rather
+  than raising an out-of-range index.
+- Negative overshoot → clamped to 0.
+
+This is the faithful match to inference, where the `num_time_bins`
+evenly-spaced samples necessarily put `t = 1.0` on the final step.
+During training we sample `t ~ U(0, 1)` continuously and quantise the
+same way, so the single `phi_m` row per bin is exercised across the
+whole `[i/B_time, (i+1)/B_time)` training interval — not just at the
+exact sample point.
+
+### 9b.3 Depth-sharing ownership — a single shared module (fork decision)
+
+**Locked decision**: queries are computed **once** in the outer model
+`ARDiTCondSANA` (via one `SANATimeCondQuery` module) and threaded into
+every block as the `q_attn` / `q_mlp` overrides. `SANATimeCondQuery`
+owns all four tensors (`w_attn`, `w_mlp`, `phi_attn`, `phi_mlp`); each
+`ARDiTCondSANABlock` owns **no** per-junction heads and simply forwards
+the two depth-shared queries it is handed. This is structurally
+parallel to how E1's `ARDiTCond` owns the `W_msa` / `W_mlp` heads and
+threads `q_msa` / `q_mlp` into each `ARDiTCondBlock`. In both E1 and
+E2, the inner junction's own `self.w` is bypassed by the
+`q_override` / `q_override_raw` branch and sees no gradient (it exists
+only for state-dict shape compatibility with v1).
+
+### 9b.4 Kernel — v1 un-scaled form, deliberately (ablation contrast)
+
+**Locked decision**: E2 uses the **v1 un-scaled kernel**
+
+```
+phi(q, k) = exp( q . RMSNorm(k) )      # E2 — raw query, no 1/sqrt(D)
+```
+
+via the new `q_override_raw` argument on `AttnResJunction.forward` —
+**not** E1's guarded kernel `exp(RMSNorm(q) · RMSNorm(k) / sqrt(D))`.
+
+This is a deliberate, principled contrast with E1 (your Q4): E1's
+query is `q = W_l · τ + w`, where `W_l` is an upstream `nn.Linear`, so
+its spectral norm can grow unboundedly and needs both in-kernel guards
+(query-side RMSNorm + `1/√D`) to keep softmax logits bounded. E2's
+query is `q = w_m + phi_m[bin]`, a **directly-optimised parameter
+tensor** (not a matrix-product output), so its magnitude is bounded by
+weight decay + gradient dynamics alone. Adding q_rms and `1/√D` here
+would be an unnecessary numerical intervention. The `_raw` suffix
+names exactly this: the query enters the kernel *as-is*, with no
+query-side normalisation and no `1/√D` divisor.
+
+Note (attention-terminology rule [[memory:j6445n1q]]): in both
+branches the **key** is `k_i = v_i =` the raw sub-layer output, and
+RMSNorm lives *inside* the kernel `ϕ(q, k) = exp(q · RMSNorm(k))` — it
+is not part of the key's definition. The only difference between the
+E1 and E2 kernels is the query-side treatment (E1 normalises+scales the
+query; E2 does not).
+
+### 9b.5 Initialisation — zero, matches v1 exactly at step 0
+
+**Locked decision**: `w_m = 0` and `phi_m = 0` for all `m`. Then
+`q_m(t) ≡ 0` for every `t` at step 0, and the model output is
+**bit-exactly zero** — `ARDiTCondSANA(x, t, y) == 0` for all `t`,
+satisfying the same acceptance criterion as v1 (§10) and E1 (§9a.5).
+
+The zero-init also makes the *depth mix* uniform and **time-invariant**
+at init: with `q_m = 0`, every logit is `0`, `α_{i→l} = 1/l`
+(per-junction uniform), and the time codebook contributes nothing —
+so E2 degenerates to v1 at init regardless of `t`. The continuous `t`
+signal is "switched on" only as `phi_m` and `w_m` learn away from zero,
+under the same progressive warm-up behaviour adaLN-Zero itself
+exhibits (§9a.8). This keeps the ablation clean: any FID delta
+E2-vs-v1 is attributable purely to the learned `(w_m + phi_m[t])`
+time-depth mixing, not to an init-time perturbation.
+
+### 9b.6 Module API and file layout
+
+```
+models/
+└── ar_dit.py
+    ├── class AttnResJunction(nn.Module)      # (existing) — forward gains q_override_raw kwarg
+    ├── class SANATimeCondQuery(nn.Module)    # NEW — E2 shared time-cond query (w + phi codebooks)
+    ├── class ARDiTCondSANABlock(nn.Module)   # NEW — E2 block, owns NO per-junction heads
+    ├── class ARDiTCondSANA(nn.Module)        # NEW — E2 end-to-end model
+    └── presets ARDiTCondSANA_{S,B,L,XL}_2     # NEW — 4 sizes, mirror ARDiT_{S,B,L,XL}_2
+```
+
+- `SANATimeCondQuery.forward(t: [B], kind: str) -> [B, D]` is called
+  twice per outer forward (kind `'attn'`, then `'mlp'`); outputs are
+  broadcast to every block.
+- `ARDiTCondSANABlock.forward(x, c, q_attn, q_mlp, cache)` parallels
+  `ARDiTBlock.forward` but receives the two depth-shared queries and
+  passes them as `q_override_raw` to the junctions.
+- Config: `num_time_bins` is an optional `ModelConfig` field
+  (default `50`), forwarded only to `_ARCHES_WITH_TIME_BINS`
+  (`ARDiTCondSANA` and its presets) by `build_model_from_config`.
+- Training: four new grad-norm groups in `utils/grad_norm.py` —
+  `sana_time_cond.w_attn`, `sana_time_cond.w_mlp`,
+  `sana_time_cond.phi_attn`, `sana_time_cond.phi_mlp` — let the
+  optimizer's RMSNorm-style diagnostics track whether the codebook
+  drifts during training.
+
+Selection between v1 / E1 / E2 is **purely** via config + the model
+registry (`models/__init__.py`): `build_model_from_config` dispatches
+on the model name; `num_time_bins` is accepted only by the E2
+presets.
+
+### 9b.7 Test plan (E2-specific)
+
+| Test (in `tests/test_ar_dit.py`) | Assertion | Why it's the smoking gun |
+|---|---|---|
+| `test_sana_time_quantise_bounds` | `floor(t · B)` stays in `[0, B-1]` for `t = 0.0`, `0.999`, `1.0`, tiny overshoot. | Quantisation clamps correctly; no OOB index. |
+| `test_sana_forward_shape_and_dtype` | `ARDiTCondSANA(x, t, y)` is `[B, N, C]`, same dtype as `x`. | API parity with v1 / E1. |
+| `test_sana_zero_init_output_is_zero` | `torch.equal(ARDiTCondSANA(x, t, y), zeros_like(...))` at init, for several `t`. | Zero-init invariant holds across `t`. |
+| `test_sana_zero_init_uniform_mix` | Hook `FinalLayer` input at init; assert `= v_0 / (2L+1)` for `t = 0.01` **and** `t = 0.99`. | Depth mix uniform **and time-invariant** at init (codebook contributes nothing). |
+| `test_sana_param_count` | Exact analytical diff vs baseline `= 2·D + 2·B·D`. | Confirms depth-sharing + codebook size. |
+| `test_sana_time_dependence` | After manually setting `phi_mlp[last]` nonzero + `FinalLayer.linear` nonzero, changing `t` alone changes output by `> 1e-2`. | E2 depends on `t` via the AttnRes path, not just adaLN-Zero. |
+| `test_sana_grad_flow` | Forward + MSE + backward at init; every E2 param has `grad is not None and isfinite`. | Modules are on the backward graph. |
+
+The provisional-test caveat from §9a still applies — these tests are
+coverage, not correctness certification, pending the dedicated review
+pass.
+
+---
+
 ## 10. Initialisation
 
 **Locked decision**: `w_l = 0` for all `l`, `g_l = 1` for all RMSNorms.

@@ -39,6 +39,31 @@ E1 (time-conditioned pseudo-query) additions — doc/AR_DiT.md §9a.8:
   the correct shape for catching the real regression (E1 modules
   built but never wired into ``forward``).
 
+E2 (SANA-time-cond pseudo-query) additions — doc/AR_DiT.md §9b:
+
+- ``test_ardit_cond_sana_forward_shape_and_dtype``: parallel forward
+  test.
+- ``test_ardit_cond_sana_zero_init_output_is_zero``: parallel §9b.5
+  acceptance criterion — ``ARDiTCondSANA(x, t, y) == 0`` bit-exact at
+  init.
+- ``test_ardit_cond_sana_zero_init_uniform_mix``: diagnostic — the
+  last block's residual state at init equals ``v_0 / (2L + 1)``,
+  same as v1, because ``q_m(t) ≡ 0`` at step 0.
+- ``test_ardit_cond_sana_param_count_diff``: analytical param diff
+  vs v1 ``ARDiT`` is exactly ``2·D · (1 + num_time_bins)``.
+- ``test_ardit_cond_sana_time_dependence``: smoking-gun — after
+  perturbing the codebook entries for two different time bins away
+  from zero, changing ``t`` alone (holding ``x, y`` fixed) changes
+  the model output.
+- ``test_ardit_cond_sana_time_quantisation``: bin-boundary contract
+  — two ``t`` values falling in the same floor-quantisation bin
+  produce bit-identical outputs; two ``t`` values in different bins
+  (with a perturbed codebook) produce different outputs.
+- ``test_ardit_cond_sana_grad_flow``: forward + MSE + backward; every
+  E2 parameter is structurally reachable from the loss graph.
+  Dormant ``attn_res_*.w`` on the SANA path (bypassed by the
+  ``q_override_raw`` branch) is asserted to have no grad.
+
 .. warning::
 
    **This test file is provisional — written but not yet reviewed by the
@@ -52,7 +77,15 @@ from __future__ import annotations
 
 import torch
 
-from models.ar_dit import ARDiT, ARDiTBlock, ARDiTCond, ARDiTCondBlock
+from models.ar_dit import (
+    ARDiT,
+    ARDiTBlock,
+    ARDiTCond,
+    ARDiTCondBlock,
+    ARDiTCondSANA,
+    ARDiTCondSANABlock,
+    SANATimeCondQuery,
+)
 from models.dit import DiT
 
 
@@ -537,3 +570,345 @@ def test_ardit_cond_grad_flow():
         assert torch.isfinite(p.grad).all(), (
             f"E1 parameter {name} has non-finite gradient."
         )
+
+
+# ===========================================================================
+# E2 — SANA-time-cond pseudo-query (doc/AR_DiT.md §9b) tests
+# ===========================================================================
+# Reuses ``_MODEL_KWARGS`` and ``_make_batch`` above, plus a small
+# ``num_time_bins`` value chosen so bin-boundary tests can hit multiple
+# bins with the same small ``_make_batch(B=...)`` set-up.
+
+# Small ``num_time_bins`` for the E2 tests.  A value >= 4 is enough to
+# exercise different-bin behaviour with only two probe times; keeping
+# it small avoids paying for 50 D-vectors of parameters in every test
+# instantiation.
+_SANA_NUM_TIME_BINS: int = 5
+
+
+def _sana_kwargs(**overrides):
+    """Build ``ARDiTCondSANA`` kwargs from the shared v1 kwargs plus
+    ``num_time_bins`` (and any per-test overrides)."""
+    kw = dict(_MODEL_KWARGS)
+    kw["num_time_bins"] = _SANA_NUM_TIME_BINS
+    kw.update(overrides)
+    return kw
+
+
+def test_ardit_cond_sana_time_cond_query_quantisation_edges():
+    """Unit-level test on :class:`SANATimeCondQuery`: the floor-
+    quantiser maps ``t=0`` to bin 0, ``t=1`` to the last bin
+    ``num_time_bins-1`` (clamped, not overflowing), and bin boundaries
+    behave as documented.
+    """
+    D = _MODEL_KWARGS["hidden_size"]
+    B_time = _SANA_NUM_TIME_BINS
+    q = SANATimeCondQuery(hidden_size=D, num_time_bins=B_time)
+
+    # Directly probe the private quantiser with an exhaustive set of
+    # boundary cases.  ``_quantise`` is documented to clamp t=1.0 to
+    # the last bin.  Note on fp32: use a coarse ``eps`` well above
+    # single-precision quantisation of ``1 / B_time`` (~0.2 for
+    # B_time=5), otherwise ``(1/B_time - 1e-9) * B_time`` rounds back
+    # up to 1.0 and floor-quantisation moves the value out of bin 0.
+    eps = 1e-3
+    t = torch.tensor([
+        0.0,                          # -> 0
+        1.0 / B_time - eps,           # -> 0  (still inside bin 0)
+        1.0 / B_time + eps,           # -> 1  (just past boundary)
+        0.5,                          # -> floor(0.5 * B_time)
+        1.0 - eps,                    # -> B_time - 1
+        1.0,                          # -> B_time - 1  (clamped)
+    ])
+    expected = torch.tensor([
+        0,
+        0,
+        1,
+        int(0.5 * B_time),
+        B_time - 1,
+        B_time - 1,
+    ], dtype=torch.long)
+    got = q._quantise(t)
+    assert torch.equal(got, expected), f"quantisation mismatch: {got.tolist()} vs {expected.tolist()}"
+
+
+def test_ardit_cond_sana_forward_shape_and_dtype():
+    """Forward returns the same shape/dtype as the input image tensor."""
+    model = ARDiTCondSANA(**_sana_kwargs()).eval()
+    x, t, y = _make_batch()
+    with torch.no_grad():
+        out = model(x, t, y)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+
+
+def test_ardit_cond_sana_zero_init_output_is_zero():
+    """``ARDiTCondSANA(x, t, y) == 0`` bit-exact at initialisation.
+
+    §9b.5 acceptance criterion.  Mechanism: ``w_attn = w_mlp =
+    phi_attn = phi_mlp = 0`` in :class:`SANATimeCondQuery`, so
+    ``q_m(t) ≡ 0`` for every ``t``.  Under the un-scaled kernel
+    ``exp(0 · RMSNorm(k)) = 1`` uniformly across sources; softmax over
+    a uniform vector is uniform; and ``FinalLayer.linear = 0`` zeros
+    the output.  Same observable as v1 / E1, different internal
+    wiring.
+    """
+    model = ARDiTCondSANA(**_sana_kwargs()).eval()
+    x, t, y = _make_batch()
+    with torch.no_grad():
+        out = model(x, t, y)
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+def test_ardit_cond_sana_zero_init_uniform_mix():
+    """The residual-stream state entering ``FinalLayer`` at init equals
+    ``v_0 / (2L + 1)``, regardless of the timestep ``t``.
+
+    E2-specific version of the v1 diagnostic.  Goes further than v1:
+    v1's ``w = 0`` alone makes ``α`` uniform trivially, but E2 also
+    requires ``q_m(t) ≡ 0`` for every ``t``, which only holds if all
+    four :class:`SANATimeCondQuery` tensors are truly zero-inited
+    (§9b.5).  A regression where ``phi_*`` were accidentally
+    Xavier-inited would still pass ``output_is_zero`` (because
+    ``FinalLayer.linear`` zeros the output), but would break this
+    diagnostic.
+    """
+    model = ARDiTCondSANA(**_sana_kwargs()).eval()
+    x, _, y = _make_batch()
+
+    v0 = model.x_embedder(x) + model.pos_embed                 # (B, N, D)
+    L = _MODEL_KWARGS["depth"]
+    expected = v0 / (2 * L + 1)
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _hook(_module, args, _output):
+        captured["h_in"] = args[0].detach().clone()
+
+    handle = model.final_layer.register_forward_hook(_hook)
+    try:
+        for t_val in (0.01, 0.5, 0.99):
+            t_probe = torch.full((x.shape[0],), t_val)
+            with torch.no_grad():
+                _ = model(x, t_probe, y)
+            torch.testing.assert_close(
+                captured["h_in"], expected, atol=1e-6, rtol=1e-5,
+                msg=f"E2 uniform-mix broken at t={t_val}",
+            )
+    finally:
+        handle.remove()
+
+
+def test_ardit_cond_sana_param_count_diff():
+    """Params(ARDiTCondSANA) - Params(ARDiT) == 2·D + 2·B·D exactly.
+
+    Breakdown (doc §9b):
+
+    * Depth-shared additive biases ``w_attn`` + ``w_mlp``: 2 · D
+      scalars total (one D-vector per junction kind, shared across
+      all 2L junctions).
+    * Time codebooks ``phi_attn`` + ``phi_mlp`` of shape
+      ``[num_time_bins, D]``: 2 · B · D scalars total.
+    * ARDiTCondSANA adds no per-block per-junction linear heads
+      (contrast with E1), so no ``L``-scaling term appears.
+    """
+    sana = ARDiTCondSANA(**_sana_kwargs())
+    ar = ARDiT(**_MODEL_KWARGS)
+    n_sana = sum(p.numel() for p in sana.parameters())
+    n_ar = sum(p.numel() for p in ar.parameters())
+    D = _MODEL_KWARGS["hidden_size"]
+    B = _SANA_NUM_TIME_BINS
+    expected_diff = 2 * D + 2 * B * D
+    assert n_sana - n_ar == expected_diff, (
+        f"E2 param diff {n_sana - n_ar} != expected {expected_diff} "
+        f"(D={D}, num_time_bins={B})"
+    )
+
+
+def test_ardit_cond_sana_time_dependence():
+    """Perturbing the SANA codebook so different bins carry different
+    values, and unmuting ``FinalLayer.linear``, causes the model
+    output to depend on ``t`` via the SANA path.
+
+    Perturbation targets:
+
+    1. ``time_cond_query.phi_mlp[b0] = random``,
+       ``time_cond_query.phi_mlp[b1] = random`` (different rows)
+       — so ``q_mlp`` differs between the two bins.  We deliberately
+       perturb ``phi_mlp`` rather than ``phi_attn`` so the signal
+       flows through the *last* junction (the MLP one), whose output
+       feeds directly into ``FinalLayer`` without being multiplied by
+       another adaLN-Zero gate.
+    2. ``final_layer.linear.weight = random`` so residual-stream
+       differences survive to the model output.
+
+    A regression where the SANA path silently reused v1's per-
+    junction ``self.w`` (bypassing the codebook lookup) would give
+    identical outputs across ``t`` and fail this test.
+    """
+    torch.manual_seed(0)
+    kwargs = _sana_kwargs()
+    model = ARDiTCondSANA(**kwargs).eval()
+
+    D = kwargs["hidden_size"]
+    B_time = kwargs["num_time_bins"]
+
+    # Pick two bin indices at the extremes of the codebook.
+    b_lo, b_hi = 0, B_time - 1
+    with torch.no_grad():
+        model.time_cond_query.phi_mlp[b_lo].copy_(torch.randn(D) * 1.0)
+        model.time_cond_query.phi_mlp[b_hi].copy_(torch.randn(D) * 1.0)
+        # Also perturb the corresponding attn codebook rows to
+        # increase signal — but the last-MLP-junction path is the
+        # dominant contributor since it is not gated by adaLN-Zero.
+        model.time_cond_query.phi_attn[b_lo].copy_(torch.randn(D) * 1.0)
+        model.time_cond_query.phi_attn[b_hi].copy_(torch.randn(D) * 1.0)
+        model.final_layer.linear.weight.copy_(
+            torch.randn_like(model.final_layer.linear.weight) * 1.0
+        )
+
+    # Two probe times that fall in bins b_lo and b_hi respectively.
+    # Bin i covers [i / B_time, (i + 1) / B_time), so mid-bin values
+    # (i + 0.5) / B_time are safe.
+    t_lo_val = (b_lo + 0.5) / B_time
+    t_hi_val = (b_hi + 0.5) / B_time
+
+    x, _, y = _make_batch()
+    t_lo = torch.full((x.shape[0],), t_lo_val)
+    t_hi = torch.full((x.shape[0],), t_hi_val)
+
+    with torch.no_grad():
+        out_lo = model(x, t_lo, y)
+        out_hi = model(x, t_hi, y)
+
+    # SANA uses the un-scaled kernel ``exp(q · RMSNorm(k))`` — no
+    # 1/sqrt(D) attenuation, no query-side RMSNorm bounding — so
+    # the observable signal is much larger than E1's ~3e-4 for the
+    # same perturbation setup.  A loose 1e-4 floor still rejects a
+    # bit-zero delta from a silently-unreachable SANA path.
+    delta = (out_hi - out_lo).abs().max().item()
+    assert delta > 1e-4, (
+        f"ARDiTCondSANA output does not depend on t via the SANA path "
+        f"(max |Δoutput| = {delta:.3e}). Suspect: q_override_raw branch "
+        f"of AttnResJunction not exercised, or SANATimeCondQuery lookup "
+        f"is broken."
+    )
+
+
+def test_ardit_cond_sana_time_quantisation_boundary():
+    """Two ``t`` values that fall in the **same** floor-quantisation
+    bin produce **bit-identical** outputs; two ``t`` values in
+    different bins (with a perturbed codebook) produce **different**
+    outputs.
+
+    This is the contract enforced by :meth:`SANATimeCondQuery._quantise`:
+    bin ``i`` covers ``[i / B_time, (i + 1) / B_time)``.  A regression
+    where the quantiser used, say, ``round`` semantics or a different
+    bin count would flip both assertions.
+    """
+    torch.manual_seed(0)
+    kwargs = _sana_kwargs()
+    model = ARDiTCondSANA(**kwargs).eval()
+
+    D = kwargs["hidden_size"]
+    B_time = kwargs["num_time_bins"]
+
+    # Perturb the codebook so different bins actually differ, and
+    # unmute ``final_layer.linear`` so the signal survives to output.
+    with torch.no_grad():
+        model.time_cond_query.phi_attn.copy_(torch.randn(B_time, D) * 0.5)
+        model.time_cond_query.phi_mlp.copy_(torch.randn(B_time, D) * 0.5)
+        model.final_layer.linear.weight.copy_(
+            torch.randn_like(model.final_layer.linear.weight) * 1.0
+        )
+
+    x, _, y = _make_batch()
+
+    # Two t values inside the SAME bin (bin 1, say).  Both must map
+    # to bin 1 under floor(t * B_time), so their model outputs must
+    # be bit-identical.
+    bin_idx = 1
+    t_a_val = bin_idx / B_time + 1e-4                # just past lower edge
+    t_b_val = (bin_idx + 1) / B_time - 1e-4          # just before upper edge
+    t_a = torch.full((x.shape[0],), t_a_val)
+    t_b = torch.full((x.shape[0],), t_b_val)
+
+    with torch.no_grad():
+        out_a = model(x, t_a, y)
+        out_b = model(x, t_b, y)
+    assert torch.equal(out_a, out_b), (
+        "Same-bin outputs are not bit-identical — the quantiser is "
+        "leaking continuous t into the query."
+    )
+
+    # A t value in a DIFFERENT bin (bin 3) must produce a different
+    # output.
+    other_bin = 3
+    assert other_bin != bin_idx and other_bin < B_time
+    t_c_val = (other_bin + 0.5) / B_time
+    t_c = torch.full((x.shape[0],), t_c_val)
+    with torch.no_grad():
+        out_c = model(x, t_c, y)
+    delta = (out_c - out_a).abs().max().item()
+    assert delta > 1e-4, (
+        f"Different-bin outputs are indistinguishable "
+        f"(max |Δoutput| = {delta:.3e}) — codebook lookup may be broken."
+    )
+
+
+def test_ardit_cond_sana_grad_flow():
+    """Full forward + MSE loss + backward.  Every trainable parameter
+    other than the dormant ``attn_res_*.w`` (bypassed by the SANA
+    ``q_override_raw`` code path) is structurally reachable from the
+    loss graph.  Both dormant ``.w`` and dormant ``q_rms`` scales are
+    asserted to have no gradient — those are the parameters E2 does
+    not use.
+    """
+    torch.manual_seed(0)
+    model = ARDiTCondSANA(**_sana_kwargs()).train()
+    x, t, y = _make_batch(B=3)
+    target = torch.randn_like(x)
+
+    out = model(x, t, y)
+    loss = torch.nn.functional.mse_loss(out, target)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+
+    for name, p in model.named_parameters():
+        # Dormant on the SANA path — the ``q_override_raw`` branch of
+        # :meth:`AttnResJunction.forward` bypasses both ``self.w`` and
+        # ``self.q_rms`` entirely.
+        if name.endswith(".attn_res_msa.w") or name.endswith(".attn_res_mlp.w"):
+            assert p.grad is None, (
+                f"{name} unexpectedly received gradient on the SANA "
+                "(q_override_raw) code path"
+            )
+            continue
+        if ".q_rms." in name:
+            assert p.grad is None, (
+                f"{name} unexpectedly received gradient on the SANA "
+                "(q_override_raw) code path"
+            )
+            continue
+        assert p.grad is not None, f"{name} has no gradient"
+        assert torch.isfinite(p.grad).all(), f"{name} has non-finite gradient"
+
+    # E2-specific structural check: the four SANA tensors and every
+    # ARDiTCondSANABlock's junctions are on the backward graph.
+    e2_params: dict[str, torch.nn.Parameter] = {
+        "time_cond_query.w_attn":   model.time_cond_query.w_attn,
+        "time_cond_query.w_mlp":    model.time_cond_query.w_mlp,
+        "time_cond_query.phi_attn": model.time_cond_query.phi_attn,
+        "time_cond_query.phi_mlp":  model.time_cond_query.phi_mlp,
+    }
+    for name, p in e2_params.items():
+        assert p.grad is not None, (
+            f"E2 parameter {name} has no gradient — the SANA code path "
+            f"may be orphaned from the loss graph."
+        )
+        assert torch.isfinite(p.grad).all(), (
+            f"E2 parameter {name} has non-finite gradient."
+        )
+    for blk in model.blocks:
+        assert isinstance(blk, ARDiTCondSANABlock)

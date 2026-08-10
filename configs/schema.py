@@ -79,6 +79,12 @@ class ModelConfig:
     patch_size: int                 # PatchEmbed kernel/stride
     num_classes: int                # e.g. 10 for CIFAR-10
     class_dropout_prob: float       # CFG label-dropout probability
+    # E2 (SANA-time-cond) — number of discrete time-codebook slots.
+    # Optional with a sensible default so non-E2 configs stay valid.
+    # ``build_model_from_config`` forwards this field only to the
+    # ``ARDiTCondSANA_*`` presets; other architectures ignore it.
+    # See doc/AR_DiT.md §9b.
+    num_time_bins: int = 50
 
     def __post_init__(self) -> None:
         if self.input_size <= 0:
@@ -97,6 +103,10 @@ class ModelConfig:
         if not 0.0 <= self.class_dropout_prob <= 1.0:
             raise ConfigError(
                 f"model.class_dropout_prob must be in [0, 1], got {self.class_dropout_prob}"
+            )
+        if self.num_time_bins < 1:
+            raise ConfigError(
+                f"model.num_time_bins must be >= 1, got {self.num_time_bins}"
             )
 
 

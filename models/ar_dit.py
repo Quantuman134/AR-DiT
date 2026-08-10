@@ -22,6 +22,23 @@ See doc/AR_DiT.md for the full design specification. This file hosts:
   ``W_msa``, ``W_mlp`` that project ``tau`` into per-junction queries.
 - ``ARDiTCond``: E1 end-to-end model, drop-in-compatible with ``ARDiT``.
 
+**E2 — SANA-time-cond pseudo-query (§9b of the spec):**
+
+- ``SANATimeCondQuery``: shared time-conditioned query module that
+  owns two depth-shared learnable D-vectors ``w_attn``, ``w_mlp`` plus
+  two learned time codebooks ``phi_attn``, ``phi_mlp`` of shape
+  ``[num_time_bins, D]``. Continuous ``t \\in [0, 1]`` is floor-
+  quantised into ``num_time_bins`` slots, and the per-image junction
+  query is ``q_m(t) = w_m + phi_m[quantise(t)]``.
+- ``ARDiTCondSANABlock``: E2 block that receives already-computed
+  ``(q_attn, q_mlp)`` from the outer model and passes them straight
+  into its two :class:`AttnResJunction` instances via the new
+  ``q_override_raw`` argument (no query-side RMSNorm, no
+  ``1/sqrt(D)`` scaling — bounded magnitude comes from the
+  parameters themselves, not from in-kernel guards).
+- ``ARDiTCondSANA``: E2 end-to-end model, drop-in-compatible with
+  ``ARDiT`` / ``ARDiTCond``.
+
 The MHSA and MLP sub-modules, the adaLN-Zero modulation MLP, and the
 patch/label/time embedders are all imported from ``models.dit`` — the
 only structural change vs baseline DiT is inside the transformer stack.
@@ -148,6 +165,7 @@ class AttnResJunction(nn.Module):
         self,
         cache: list[torch.Tensor],
         q_override: torch.Tensor | None = None,
+        q_override_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute one AttnRes junction output.
 
@@ -164,12 +182,34 @@ class AttnResJunction(nn.Module):
                 as the per-image query for this junction and
                 ``self.w`` is bypassed entirely; the caller is
                 responsible for having folded any additive bias into
-                ``q_override`` upstream.
+                ``q_override`` upstream. The E1 branch additionally
+                applies :attr:`q_rms` and a ``1/sqrt(D)`` scaling
+                factor for softmax-saturation safety.
+            q_override_raw: optional per-image query of shape ``[B, D]``
+                for the **E2 / ARDiTCondSANA** code path (see
+                doc/AR_DiT.md §9b). Semantics differ from
+                ``q_override`` in two ways: the query-side RMSNorm is
+                **not** applied, and the softmax logit is **not**
+                scaled by ``1/sqrt(D)``. The kernel is
+                ``phi(q, k) = exp(q . RMSNorm(k))`` — identical to
+                v1's kernel structurally, only with a per-image
+                time-conditioned ``q`` in place of the global
+                constant ``self.w``. Rationale (§9b.4): E2's ``q`` is
+                a directly-optimised parameter (not the output of an
+                upstream matrix product), so its magnitude is
+                bounded by weight decay / gradient dynamics alone —
+                no in-kernel guards are needed and the paper-faithful
+                un-scaled kernel is preserved.
+                At most one of ``q_override`` and ``q_override_raw``
+                may be non-``None``.
 
         Returns:
             ``[B, N, D]`` mixture tensor ``h_l``.
         """
         assert len(cache) > 0, "AttnResJunction: cache must be non-empty."
+        assert not (q_override is not None and q_override_raw is not None), (
+            "AttnResJunction: q_override and q_override_raw are mutually exclusive."
+        )
 
         # Stack the source pool along a new source axis.
         # sources: [B, N, l, D]
@@ -180,8 +220,8 @@ class AttnResJunction(nn.Module):
         keys_normed = self.rms(sources)
 
         # Logit_i = q . RMSNorm(k_i)   — per (b, n, i) dot product.
-        # Two query modes:
-        #   * v1 (q_override is None): q = self.w  of shape [D].
+        # Three query modes:
+        #   * v1 (both overrides None): q = self.w  of shape [D].
         #     Same query for every image in the batch — a global
         #     constant. einsum contracts the model dim ``d`` only.
         #     ``self.w`` is used un-normed and un-scaled: it is
@@ -210,10 +250,19 @@ class AttnResJunction(nn.Module):
         #       phi(q, k) = exp( RMSNorm(q) . RMSNorm(k) / sqrt(D) ).
         #     einsum contracts the model dim ``d`` while broadcasting
         #     the batch dim ``b``. See doc/AR_DiT.md §9a.6.
-        # logits: [B, N, l] in both branches.
-        if q_override is None:
-            logits = torch.einsum("d,bnld->bnl", self.w, keys_normed)
-        else:
+        #   * E2 (q_override_raw provided): q = q_override_raw of
+        #     shape [B, D]. Structurally identical to v1's kernel —
+        #     no query-side RMSNorm, no 1/sqrt(D) scaling — only the
+        #     source of ``q`` changes (per-image time-conditioned
+        #     query instead of a global constant). Safe here because
+        #     E2's ``q`` is a directly-optimised parameter tensor
+        #     rather than the output of an upstream Linear, so its
+        #     magnitude is bounded by weight decay / gradient
+        #     dynamics alone and does not need in-kernel guards.
+        #     einsum contracts ``d`` and broadcasts ``b``. See
+        #     doc/AR_DiT.md §9b.4.
+        # logits: [B, N, l] in all branches.
+        if q_override is not None:
             assert q_override.ndim == 2 and q_override.shape[-1] == self.hidden_size, (
                 f"AttnResJunction: q_override must have shape [B, D={self.hidden_size}]; "
                 f"got {tuple(q_override.shape)}."
@@ -223,6 +272,14 @@ class AttnResJunction(nn.Module):
             # the softmax argument at O(1) w.r.t. hidden size.
             scale = 1.0 / math.sqrt(self.hidden_size)
             logits = torch.einsum("bd,bnld->bnl", q_normed, keys_normed) * scale
+        elif q_override_raw is not None:
+            assert q_override_raw.ndim == 2 and q_override_raw.shape[-1] == self.hidden_size, (
+                f"AttnResJunction: q_override_raw must have shape [B, D={self.hidden_size}]; "
+                f"got {tuple(q_override_raw.shape)}."
+            )
+            logits = torch.einsum("bd,bnld->bnl", q_override_raw, keys_normed)
+        else:
+            logits = torch.einsum("d,bnld->bnl", self.w, keys_normed)
 
         # Softmax over the source axis (length l).
         # alpha: [B, N, l]
@@ -890,3 +947,450 @@ def ARDiTCond_L_2(**kwargs) -> ARDiTCond:
 def ARDiTCond_XL_2(**kwargs) -> ARDiTCond:
     kwargs.setdefault("patch_size", 2)
     return ARDiTCond(depth=28, hidden_size=1152, num_heads=16, **kwargs)
+
+
+# ===========================================================================
+# E2 — SANA-time-cond pseudo-query (doc/AR_DiT.md §9b)
+# ===========================================================================
+# E1 replaced v1's global constant ``w_l`` with a per-junction, per-image
+# query ``q_l(t) = W_l(tau) + w_l``.  Two levers changed together:
+# depth-per-junction specialisation (each of the 2L junctions owns its
+# own ``W_l``) *and* time dependence (via the shared trunk ``tau``).
+#
+# E2 keeps the second lever (time dependence) but reverses the first
+# (depth-per-junction specialisation).  Instead:
+#
+#   * ``w_m`` is depth-shared across all junctions of type ``m ∈
+#     {attn, mlp}`` — only two learnable D-vectors total for the
+#     whole network, replacing v1's 2L per-junction constants.
+#   * Time dependence comes from a **learned codebook**
+#     ``phi_m[bin_idx, :]`` of shape ``[num_time_bins, D]`` rather
+#     than from an MLP over the timestep embedding.  Continuous ``t
+#     ∈ [0, 1]`` is floor-quantised to a bin index, matching the
+#     discrete-schedule reality of inference-time samplers (e.g. 50
+#     Euler steps → 50 codebook entries).
+#
+# The junction query becomes
+#
+#     q_m(t) = w_m + phi_m[ floor(t * num_time_bins) ]         (§9b.1)
+#
+# and every junction of type ``m`` in the network uses this same
+# ``q_m(t)`` — one query per (kind, time-bin, image) tuple, shared
+# across depth.  This is a different research hypothesis than E1: E1
+# tests "should the query be time-conditioned and depth-specialised
+# and produced by an MLP over t_emb?", E2 tests "is depth sharing +
+# a discrete time codebook enough?".
+#
+# Both branches keep v1's zero-init discipline: ``w_m = phi_m = 0`` at
+# init, so ``q_m(t) ≡ 0`` for every ``t`` at step 0, and the model
+# output remains bit-exactly zero (§9b.5).
+#
+# Kernel-level rationale.  E2 uses the v1 un-scaled kernel ``phi(q,
+# k) = exp(q . RMSNorm(k))`` (via the new ``q_override_raw``
+# argument on ``AttnResJunction.forward``), *not* the E1 kernel
+# ``phi(q, k) = exp(RMSNorm(q) . RMSNorm(k) / sqrt(D))``.  E2's
+# ``q`` is a directly-optimised parameter tensor rather than the
+# output of an upstream Linear head, so its magnitude is bounded by
+# weight decay + gradient dynamics alone and does not need in-kernel
+# guards.  This is a deliberate ablation contrast with E1 — see
+# §9b.4.
+
+
+class SANATimeCondQuery(nn.Module):
+    """Shared time-conditioned query module for E2 (§9b).
+
+    Owns four learnable tensors, all zero-initialised:
+
+    * ``w_attn`` of shape ``[D]`` — depth-shared additive bias for
+      every MHSA junction in the network.
+    * ``w_mlp``  of shape ``[D]`` — depth-shared additive bias for
+      every MLP  junction in the network.
+    * ``phi_attn`` of shape ``[num_time_bins, D]`` — time codebook
+      for MHSA junctions.
+    * ``phi_mlp``  of shape ``[num_time_bins, D]`` — time codebook
+      for MLP junctions.
+
+    Given continuous ``t \\in [0, 1]``, the module produces the per-
+    image query for junction kind ``m`` as
+
+    .. math::
+
+        q_m(t) = w_m + \\phi_m[\\lfloor t \\cdot B_{\\text{time}} \\rfloor]
+
+    where ``B_time = num_time_bins``.  The floor-quantisation is
+    clamped so that ``t = 1.0`` (or any tiny numerical overshoot)
+    maps to the last bin ``num_time_bins - 1`` instead of an
+    out-of-range index.
+
+    Shapes
+    ------
+    ``forward(t: [B], kind: str) -> [B, D]``.  The same module
+    instance is called twice per outer-model forward (once with
+    ``kind='attn'``, once with ``kind='mlp'``) and its outputs are
+    broadcast to every block that needs them.
+
+    Init
+    ----
+    All four tensors are zero-init.  This preserves v1's ``q ≡ 0`` at
+    step 0 property — see :meth:`ARDiTCondSANA._init_weights` and
+    doc/AR_DiT.md §9b.5.
+    """
+
+    def __init__(self, hidden_size: int, num_time_bins: int):
+        super().__init__()
+        if num_time_bins < 1:
+            raise ValueError(
+                f"num_time_bins must be >= 1; got {num_time_bins}."
+            )
+        self.hidden_size = hidden_size
+        self.num_time_bins = num_time_bins
+
+        # Depth-shared additive biases (one D-vector per junction kind).
+        # Zero-init preserves the ARDiT(x, t, y) == 0 invariant at step 0.
+        self.w_attn = nn.Parameter(torch.zeros(hidden_size))
+        self.w_mlp  = nn.Parameter(torch.zeros(hidden_size))
+
+        # Time codebooks — one row per discrete inference-time bin.
+        # Zero-init preserves the same invariant.
+        self.phi_attn = nn.Parameter(torch.zeros(num_time_bins, hidden_size))
+        self.phi_mlp  = nn.Parameter(torch.zeros(num_time_bins, hidden_size))
+
+    def _quantise(self, t: torch.Tensor) -> torch.Tensor:
+        """Map continuous ``t \\in [0, 1]`` to integer bin indices in
+        ``[0, num_time_bins - 1]``.
+
+        Uses **floor** quantisation: bin ``i`` covers
+        ``[i / num_time_bins, (i + 1) / num_time_bins)``.  ``t = 0.0``
+        maps to bin 0; ``t = 1.0`` (or any numerical overshoot beyond
+        1) is clamped to the last bin ``num_time_bins - 1`` rather
+        than triggering an out-of-range index.  Negative overshoot is
+        similarly clamped to 0.
+
+        Args:
+            t: ``[B]`` float tensor of times.
+
+        Returns:
+            ``[B]`` long tensor of bin indices.
+        """
+        assert t.ndim == 1, f"SANATimeCondQuery: expected 1-D t; got shape {tuple(t.shape)}."
+        idx = torch.floor(t * self.num_time_bins).long()
+        idx = torch.clamp(idx, min=0, max=self.num_time_bins - 1)
+        return idx
+
+    def forward(self, t: torch.Tensor, kind: str) -> torch.Tensor:
+        """Return the E2 per-image junction query.
+
+        Args:
+            t: ``[B]`` float tensor of continuous times in ``[0, 1]``.
+            kind: one of ``'attn'`` or ``'mlp'``.
+
+        Returns:
+            ``[B, D]`` query tensor ``q_m(t) = w_m + phi_m[quantise(t)]``.
+        """
+        if kind == "attn":
+            w, phi = self.w_attn, self.phi_attn
+        elif kind == "mlp":
+            w, phi = self.w_mlp, self.phi_mlp
+        else:
+            raise ValueError(
+                f"SANATimeCondQuery.forward: kind must be 'attn' or 'mlp'; got {kind!r}."
+            )
+        idx = self._quantise(t)                     # [B]
+        # phi[idx] uses integer advanced indexing → shape [B, D].
+        # w is [D]; broadcast-add gives [B, D].
+        return w + phi[idx]
+
+
+class ARDiTCondSANABlock(nn.Module):
+    """One E2 transformer block: :class:`ARDiTBlock` structure with the
+    two junctions driven by externally-supplied per-image queries.
+
+    Structurally identical to :class:`ARDiTBlock` — same non-affine
+    LayerNorms, same :class:`~models.dit.Attention`, same
+    :class:`~models.dit.MLP`, same six-way adaLN-Zero modulation, same
+    two :class:`AttnResJunction` instances.  Unlike :class:`ARDiTCondBlock`,
+    this block owns **no** per-junction linear heads: the queries
+    ``q_attn``, ``q_mlp`` are computed once in
+    :meth:`ARDiTCondSANA.forward` (via a shared
+    :class:`SANATimeCondQuery`) and threaded through every block, in
+    keeping with E2's depth-sharing design (§9b.1).
+
+    The junction's own ``self.w`` parameter is **unused** on this
+    code path (the ``q_override_raw`` branch of
+    :meth:`AttnResJunction.forward` bypasses it), and consequently
+    sees no gradient — it exists on the module only for state-dict
+    shape compatibility with v1 / E1.
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        # ---- Baseline DiT block components (structurally identical) ----
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp = MLP(hidden_size, mlp_ratio=mlp_ratio)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+        # ---- AttnRes junctions (identical to ARDiTBlock / ARDiTCondBlock) ----
+        self.attn_res_msa = AttnResJunction(hidden_size)
+        self.attn_res_mlp = AttnResJunction(hidden_size)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        q_attn: torch.Tensor,
+        q_mlp: torch.Tensor,
+        cache: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run one E2 block and grow ``cache`` by two entries in place.
+
+        Args:
+            x: ``[B, N, D]`` current residual-stream state ``h_{2b}``.
+            c: ``[B, D]`` global conditioning vector (``t_emb + y_emb``);
+                drives adaLN-Zero, exactly as in :class:`ARDiTBlock`.
+            q_attn: ``[B, D]`` per-image query for the MHSA junction.
+                Depth-shared across all blocks — the same tensor is
+                passed to every block in a given forward.
+            q_mlp:  ``[B, D]`` per-image query for the MLP junction.
+                Depth-shared across all blocks.
+            cache: mutable list of prior sub-layer outputs; contract
+                identical to :meth:`ARDiTBlock.forward`.
+
+        Returns:
+            ``[B, N, D]`` residual-stream state after this block —
+            i.e. the output of the MLP junction, ``h_{2b+2}``.
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+
+        # --- MHSA sub-layer -------------------------------------------------
+        v_msa = gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa)
+        )
+        cache.append(v_msa)
+        # E2 uses the un-scaled ``q_override_raw`` kernel — see §9b.4
+        # and the docstring of :meth:`AttnResJunction.forward`.
+        x = self.attn_res_msa(cache, q_override_raw=q_attn)   # h_{2b+1}
+
+        # --- MLP sub-layer --------------------------------------------------
+        v_mlp = gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
+        cache.append(v_mlp)
+        x = self.attn_res_mlp(cache, q_override_raw=q_mlp)    # h_{2b+2}
+
+        return x
+
+
+class ARDiTCondSANA(nn.Module):
+    """E2 — SANA-time-conditioned Attention-Residual Diffusion Transformer.
+
+    Drop-in replacement for :class:`ARDiT` / :class:`ARDiTCond`.  The
+    public API — ``__init__`` signature (plus a new ``num_time_bins``
+    kwarg), ``forward(x, t, y) -> Tensor``, and output shape — is
+    byte-identical apart from the extra kwarg, so any config-driven
+    caller wired to accept a ``num_time_bins`` field works unchanged.
+
+    Differences from :class:`ARDiT` (see doc/AR_DiT.md §9b):
+
+    - A single :class:`SANATimeCondQuery` module (``self.time_cond_query``)
+      owns the four E2 parameter tensors: two depth-shared additive
+      biases ``w_attn`` / ``w_mlp`` and two time codebooks
+      ``phi_attn`` / ``phi_mlp`` of shape ``[num_time_bins, D]``.
+    - Each block is an :class:`ARDiTCondSANABlock`; the block owns no
+      new parameters relative to v1 (no per-junction linear heads —
+      that is E1's design).
+    - On every forward, the model computes ``q_attn = w_attn +
+      phi_attn[quantise(t)]`` and ``q_mlp = w_mlp + phi_mlp[quantise(t)]``
+      **once** and threads both into every block.
+    - Initialisation: all four E2 tensors are zero-init.  Combined
+      with :meth:`AttnResJunction.__init__` (``rms.weight = q_rms.weight
+      = 1``), this guarantees ``q_m(t) ≡ 0`` for every ``t`` at step 0
+      and therefore preserves the ``ARDiT(x, t, y) == 0`` init
+      invariant (§9b.5).
+
+    Everything else — patch/label/time embedders, positional embedding,
+    class-dropout mechanics, FinalLayer, unpatchify, adaLN-Zero — is
+    byte-identical to :class:`ARDiT`.  The class label ``y`` continues
+    to reach the transformer stack **only** through adaLN-Zero via
+    ``c = t_emb + y_emb``; it is deliberately kept out of the E2 query
+    path (§9b.2 mirrors §9a.2).
+    """
+
+    def __init__(
+        self,
+        input_size: int = 32,
+        in_channels: int = 3,
+        patch_size: int = 2,
+        hidden_size: int = 384,
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        num_classes: int = 10,
+        class_dropout_prob: float = 0.1,
+        num_time_bins: int = 50,
+    ):
+        super().__init__()
+        assert input_size % patch_size == 0, (
+            f"input_size ({input_size}) must be divisible by patch_size ({patch_size})."
+        )
+
+        self.input_size = input_size
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.num_classes = num_classes
+        self.depth = depth
+        self.num_time_bins = num_time_bins
+        # Flow matching with velocity prediction: out_channels == in_channels.
+        self.out_channels = in_channels
+
+        # Embedders (byte-identical to baseline DiT / ARDiT).
+        self.x_embedder = PatchEmbed(in_channels, hidden_size, patch_size)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, p_drop=class_dropout_prob)
+
+        # Fixed 2D sin-cos positional embedding (as in baseline DiT).
+        num_patches_per_side = input_size // patch_size
+        self.num_patches = num_patches_per_side ** 2
+        self.register_buffer(
+            "pos_embed",
+            torch.zeros(1, self.num_patches, hidden_size),
+            persistent=False,
+        )
+        pos = get_2d_sincos_pos_embed(hidden_size, num_patches_per_side)
+        self.pos_embed.copy_(torch.from_numpy(pos).float().unsqueeze(0))
+
+        # E2: shared time-conditioned query module (§9b.1).  Owned by
+        # the model; passed into every block indirectly via the two
+        # ``[B, D]`` tensors it produces once per forward.
+        self.time_cond_query = SANATimeCondQuery(hidden_size, num_time_bins)
+
+        # Transformer stack — ARDiTCondSANABlock instead of ARDiTBlock.
+        self.blocks = nn.ModuleList([
+            ARDiTCondSANABlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+            for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
+        self._init_weights()
+
+    # ------------------------------------------------------------------
+    # Init
+    # ------------------------------------------------------------------
+    def _init_weights(self) -> None:
+        """Weight init: identical to :class:`ARDiT`.
+
+        The E2-specific parameters ``w_attn``, ``w_mlp``, ``phi_attn``,
+        ``phi_mlp`` are already zero-initialised by
+        :class:`SANATimeCondQuery.__init__` (and, because they are
+        ``nn.Parameter`` not ``nn.Linear``, are not touched by the
+        generic Xavier pass below).  Combined with the v1
+        ``AttnResJunction.w = 0``, this guarantees the un-used ``self.w``
+        stays at zero and ``q_m(t) ≡ 0`` at step 0 for every ``t``,
+        which in turn preserves ``ARDiTCondSANA(x, t, y) == 0`` bit-
+        exactly at init (see doc/AR_DiT.md §9b.5).
+        """
+        # Default Linear init: Xavier-uniform with zero bias.
+        def _basic(m: nn.Module) -> None:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        self.apply(_basic)
+
+        # Re-zero the modulation layers (adaLN-Zero) of every block and the
+        # final layer's linear.  These overrides MUST run after the generic
+        # ``_basic`` pass above.
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN_modulation[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.linear.weight)
+        nn.init.zeros_(self.final_layer.linear.bias)
+
+    # ------------------------------------------------------------------
+    # Patchify / unpatchify
+    # ------------------------------------------------------------------
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, N, P*P*C_out) -> (B, C_out, H, W)."""
+        c = self.out_channels
+        p = self.patch_size
+        h = w = int(math.sqrt(x.shape[1]))
+        assert h * w == x.shape[1], "Token count is not a perfect square."
+        x = x.reshape(x.shape[0], h, w, p, p, c)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], c, h * p, w * p)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Predict the velocity field at state ``x_t`` (E2 variant).
+
+        Args:
+            x: (B, C, H, W) interpolant state at time ``t``.
+            t: (B,) float time values in ``[0, 1]``.
+            y: (B,) integer class labels in ``[0, num_classes]``.
+
+        Returns:
+            (B, C, H, W) predicted velocity ``v_theta(x_t, t, y)``.
+        """
+        v0 = self.x_embedder(x) + self.pos_embed                          # (B, N, D)
+
+        # Standard adaLN-Zero conditioning (same as v1 / E1).
+        c = self.t_embedder(t) + self.y_embedder(y, train=self.training)  # (B, D)
+
+        # E2 queries — computed once per forward, threaded into every block.
+        # See doc/AR_DiT.md §9b.1.
+        q_attn = self.time_cond_query(t, kind="attn")                      # (B, D)
+        q_mlp  = self.time_cond_query(t, kind="mlp")                       # (B, D)
+
+        cache: list[torch.Tensor] = [v0]
+        h = v0
+        for block in self.blocks:
+            h = block(h, c, q_attn, q_mlp, cache)                          # grows cache by 2
+        # After the loop: len(cache) == 2*depth + 1 and h == h_{2L}.
+
+        h = self.final_layer(h, c)                                        # (B, N, P*P*C)
+        return self.unpatchify(h)                                         # (B, C, H, W)
+
+    # Note: classifier-free guidance is *not* implemented here — same
+    # split as ARDiT / ARDiTCond / DiT.  The sampling code combines
+    # conditional and unconditional passes externally.
+
+
+# ---------------------------------------------------------------------------
+# ARDiTCondSANA preset factories (parallel to ARDiTCond_S_2 / _B_2 / _L_2 / _XL_2)
+# ---------------------------------------------------------------------------
+# Only (depth, hidden_size, num_heads) are fixed by these; dataset-specific
+# fields (input_size, in_channels, patch_size, num_classes,
+# class_dropout_prob) and E2-specific fields (num_time_bins) are always
+# caller-supplied via kwargs.  Names mirror the ARDiT / ARDiTCond presets
+# 1-to-1 so a config can swap ``ARDiTCond_S_2`` for ``ARDiTCondSANA_S_2``
+# and change nothing else beyond adding the ``num_time_bins`` field.
+
+def ARDiTCondSANA_S_2(**kwargs) -> ARDiTCondSANA:
+    kwargs.setdefault("patch_size", 2)
+    return ARDiTCondSANA(depth=12, hidden_size=384, num_heads=6, **kwargs)
+
+
+def ARDiTCondSANA_B_2(**kwargs) -> ARDiTCondSANA:
+    kwargs.setdefault("patch_size", 2)
+    return ARDiTCondSANA(depth=12, hidden_size=768, num_heads=12, **kwargs)
+
+
+def ARDiTCondSANA_L_2(**kwargs) -> ARDiTCondSANA:
+    kwargs.setdefault("patch_size", 2)
+    return ARDiTCondSANA(depth=24, hidden_size=1024, num_heads=16, **kwargs)
+
+
+def ARDiTCondSANA_XL_2(**kwargs) -> ARDiTCondSANA:
+    kwargs.setdefault("patch_size", 2)
+    return ARDiTCondSANA(depth=28, hidden_size=1152, num_heads=16, **kwargs)
