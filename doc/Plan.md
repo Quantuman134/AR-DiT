@@ -11,21 +11,52 @@ mitigate PreNorm magnitude dilution and improve generation quality.
 
 ## Scope
 
-We will build and compare two networks under matched compute:
+We build and compare a family of networks under matched compute:
 
 1. **DiT** — a faithful re-implementation of the standard Diffusion
    Transformer (Peebles & Xie, 2023) with adaLN-Zero conditioning.
    Serves as the baseline.
 
-2. **AR-DiT** (Attention-Residual DiT) — same backbone as DiT, but the
-   inter-layer identity residual is replaced by AttnRes.
-   - Block AttnRes variant (cheap, recommended default).
-   - Optional: timestep-conditioned pseudo-queries `w_l(t)` —
-     a diffusion-specific extension of the original method.
+2. **AR-DiT v1** — same backbone as DiT, but the inter-layer identity
+   residual is replaced by AttnRes with a per-junction static learnable
+   query `q_l = w_l`. Paper-strict AttnRes (arXiv:2603.15031). See
+   [AR_DiT.md](AR_DiT.md) §1–§8.
 
-Both networks share the same patch embedding, positional embedding,
+3. **AR-DiT E1 — `ARDiTCond`** — v1's query replaced by a continuous,
+   time-conditioned pseudo-query `q_l = W_l · MLP_shared(t_emb) + w_l`.
+   See [AR_DiT.md](AR_DiT.md) §9a.
+
+4. **AR-DiT E2 — `ARDiTCondSANA`** — SANA-style discrete time-cond
+   query `q_m(t) = w_m + phi_m[floor(t · B_time)]`, depth-shared per
+   junction kind. See [AR_DiT.md](AR_DiT.md) §9b.
+
+5. **AR-DiT §9c — `ARDiTDAR`** *(designed, not yet implemented)* —
+   Adopts the DAR (arXiv:2605.20708) paper's dynamic, activation-
+   conditioned query `q_l = W_q^{(l)}(v_{l-1}) + w_l`, per-token,
+   scaled-dot-product kernel. Full-history aggregation (no chunking,
+   per this project's convention). See [AR_DiT.md](AR_DiT.md) §9c.
+
+All variants share the same patch embedding, positional embedding,
 adaLN-Zero conditioning, and final layer, so any difference in results
-is attributable to the residual mechanism alone.
+is attributable to the residual mechanism / query parameterisation
+alone.
+
+## Current session state (2026-08-19)
+
+- **Master branch**: baseline DiT + AR-DiT v1 fully landed via
+  merged PRs.
+- **`feature/ar-dit-cond-e1`**: E1 landed (see roadmap row 8 below).
+- **`feature/ar-dit-sana-time-cond`**: E2 landed at commit `6c7b4e2`.
+- **`feature/dar-architecture`** *(current)*: freshly branched off
+  E2, holds only the paused §9c work. Design is fully recorded in
+  [AR_DiT.md](AR_DiT.md) §9c (subsections 9c.1–9c.11); no code
+  changes yet. Resume by following the 6-commit implementation
+  order in §9c.10.
+
+If you're returning after a pause: read [AR_DiT.md](AR_DiT.md) §9c
+end-to-end (~15 min), then execute §9c.10 step 1 (add
+`q_override_pertoken_scaled` branch to `AttnResJunction`) as the first
+commit on this branch.
 
 ## Planned project layout
 
@@ -90,10 +121,13 @@ tracked separately, not on this roadmap.
 | 4 | CIFAR-10 dataset adapter (`data/`)                  | ✅ Done   | dataset + transforms                                             |
 | 5 | Training / sampling entry points                    | ⚠️ Written, not yet reviewed | `train.py`, `sample.py`, `scripts/*.sh` |
 | 6 | Test suite Layers 1–4                               | ⚠️ Written, not yet reviewed | components / DiT / AR-DiT / flow+eval+data / overfit-one-batch |
-| 7 | AR-DiT model (`models/ar_dit.py`)                   | ⚠️ Written, not yet reviewed | Per-sub-layer AttnRes junctions (paper-strict, v1) — the core contribution |
-| 8 | Layer-5 golden-output regression test               | 🔒 Deferred | Blocked on a trained checkpoint; see [Test.md](Test.md) §Layer 5 |
+| 7 | AR-DiT v1 model (`models/ar_dit.py`)                | ⚠️ Written, not yet reviewed | Per-sub-layer AttnRes junctions (paper-strict, v1) — the core contribution |
+| 8 | E1 — Time-conditioned query (`ARDiTCond`)           | ✅ Landed | `feature/ar-dit-cond-e1`. See [AR_DiT.md](AR_DiT.md) §9a. `q_rms` fix landed via `fix/e1-q-rmsnorm-softmax-saturation` (see [TO_FIX.md](TO_FIX.md)). |
+| 9 | E2 — SANA discrete time-cond query (`ARDiTCondSANA`) | ✅ Landed | `feature/ar-dit-sana-time-cond`. See [AR_DiT.md](AR_DiT.md) §9b. |
+| 10 | **§9c — DAR-Dynamic** (`ARDiTDAR`)                 | 📋 Designed, not yet implemented | Branch `feature/dar-architecture` (off `feature/ar-dit-sana-time-cond` @ `6c7b4e2`). Full design record in [AR_DiT.md](AR_DiT.md) §9c. Only architectural change vs v1: per-junction query `q = W_q(v_{l-1}) + w_l`, per-token, scaled-dot-product. **No** chunking (project convention). **No** dedicated final aggregator. See §9c.10 for the 6-commit implementation order. |
+| 11 | Layer-5 golden-output regression test               | 🔒 Deferred | Blocked on a trained checkpoint; see [Test.md](Test.md) §Layer 5 |
 
-Legend: ✅ done · ⚠️ written but unreviewed · ⏳ todo · 🔒 deferred by design.
+Legend: ✅ done · ⚠️ written but unreviewed · 📋 designed but unimplemented · ⏳ todo · 🔒 deferred by design.
 
 Supporting docs completed alongside the code above: `doc/DiT.md`,
 `doc/FlowMatching.md`, `doc/Train.md`, `doc/Test.md`, and the initial
@@ -146,3 +180,6 @@ be added explicitly when introduced.
 
 - Peebles & Xie, *Scalable Diffusion Models with Transformers*, ICCV 2023.
 - Kimi Team, *Attention Residuals*, arXiv:2603.15031, 2026.
+- Xu et al., *Rethinking Cross-Layer Information Routing in Diffusion
+  Transformers* (DAR), arXiv:2605.20708, 2026 — source of the §9c
+  DAR-Dynamic query parameterisation.
