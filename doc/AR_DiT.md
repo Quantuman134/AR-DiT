@@ -923,6 +923,368 @@ pass.
 
 ---
 
+## 9c. DAR-Dynamic — activation-conditioned pseudo-query (planned, not yet implemented)
+
+**Status.** Design locked, code not yet written. Development branch:
+`feature/dar-architecture` (created off `feature/ar-dit-sana-time-cond`
+@ commit `6c7b4e2`, so all v1 / E1 / E2 machinery is available as the
+starting point). This section is a paper-ready record of the design
+decisions so implementation can resume without re-deriving anything.
+
+§9c is the third planned extension: it lifts entry E2 from the §9
+follow-ups table into a real (planned) model, but crucially it does so
+by importing the **query parameterisation** from the DAR paper
+("Rethinking Cross-Layer Information Routing in Diffusion
+Transformers", arXiv:2605.20708, 2026 — PDF at
+[tmp/DAR.pdf](../tmp/DAR.pdf)). Despite the paper's own framing as a
+distinct architecture, a careful diff (§9c.1) shows the *only*
+architectural change from our AR-DiT v1 is **how the pseudo-query is
+computed**. Everything else — the softmax-attention kernel over the
+depth-spanning history of sublayer outputs, the inclusion of the
+current sublayer output in the aggregation pool, the non-incremental
+replacement of the residual stream, the per-sublayer junction placement
+— is already what our `AttnResJunction` and `ARDiTBlock` do.
+
+DAR-Dynamic (henceforth **§9c**) leaves every other AttnRes design
+choice untouched — same 2L junctions (§3), same operator structure
+(§4), same per-patch weights (§6), same per-junction RMSNorm on the
+**key** (§7, [[memory:j6445n1q]]), same pre-residual value source
+(§8). The sole change is **where each junction's pseudo-query comes
+from**.
+
+### 9c.1 What DAR actually differs from AR-DiT on (paper diff)
+
+A per-axis comparison against our existing code, after reading the DAR
+paper end-to-end (arXiv:2605.20708) and cross-checking with
+`ARDiTBlock.forward` in [models/ar_dit.py](../models/ar_dit.py):
+
+| Aspect | AR-DiT v1 (ours) | DAR (paper) | Same? |
+|---|---|---|---|
+| Kernel form | `α = softmax(q · RMSNorm(k))` | `α = softmax(q · RMSNorm(k) / √D)` | Up to a `1/√D` scale |
+| Key definition | `k_i = v_i` raw; RMSNorm inside kernel [[memory:j6445n1q]] | same | ✅ |
+| Source pool | `{v_0, …, v_current}` — depth-spanning, **includes the current sublayer output** (see `cache.append(v_msa); x = self.attn_res_msa(cache)` in `ARDiTBlock.forward`) | same, "the source set is `S_l = {v_0, …, v_{l-1}}`" (paper Eq. after §4.1) — includes the current sublayer output as `v_{l-1}` is defined pre-transformation | ✅ |
+| Residual use | Non-incremental: `h = Σ α_i v_i` **replaces** the running stream (no `h + …` anywhere in `ARDiTBlock.forward`) | same, "replacing the running residual at each sublayer" (paper line 144) | ✅ |
+| Junction placement | Per-sublayer: 2L junctions for depth-L (one per attn, one per mlp) | Per-sublayer: paper is explicit — "we treat each self-attention or MLP sublayer" (line 291); "SiT-XL/2 (depth 28, two sublayers per chunk, hence L = 56)" (line 825) | ✅ |
+| Chunking | None (full `2L+1` history) | Optional memory-side compression (`S=4` optimal per Tab. 4). Does **not** change the number of junctions, only compresses the *source pool* seen by each. | Not architectural — memory-side only |
+| Final aggregator | `FinalLayer` on `h_{2L}` | Dedicated aggregator over `{summaries} ∪ {last-chunk v's}` (paper §C.2) | Only meaningful *with* chunking |
+| **Query** | Static `w_l` (per-junction learnable D-vector, shared across batch and time) | **`q_l(t) = W_q^{(l)} · v_{l-1}`** — per-junction `D×D` linear head applied to the input of the current sublayer; time-dependence is **implicit** (`v_{l-1}` carries `t` through adaLN) | ❌ **This is the only architectural difference** |
+
+**Consequence.** DAR is not a redesign; it's a **query parameterisation
+swap** on top of the same softmax-over-history operator we already
+have. Chunking is a memory-side optimisation orthogonal to the routing
+idea. **Per the user's decision** on 2026-08-14: we skip chunking and
+follow this project's convention of weighted-summing over the full
+history — same as v1 / E1 / E2.
+
+Query taxonomy across the four variants:
+
+| Variant | `q_l` | Batch-varying? | Time-varying? | Per-sublayer specialisation? |
+|---|---|---|---|---|
+| v1 (AR-DiT paper-strict) | `w_l` | No | No | Yes (per-junction) |
+| E1 (§9a) | `W_l · MLP_shared(t_emb) + w_l` | No | **Yes** (via `t_emb`) | Yes (per-junction `W_l`) |
+| E2 (§9b) | `w_m + phi_m[bin(t)]`  (`m ∈ {attn, mlp}`) | No | **Yes** (discrete codebook) | **No** (depth-shared per kind) |
+| §9c DAR-Dynamic | `W_q^{(l)} · v_{l-1}` (+ optional `w_l` bias — see §9c.5) | **Yes** (query depends on per-image `v_{l-1}`) | **Yes** (implicit via adaLN on `v_{l-1}`) | Yes (per-junction `W_q^{(l)}`) |
+
+§9c is the first variant with a **per-image** query — E1 and E2 are
+per-image only in that `t` varies per image, but their queries do not
+depend on `x` or `y`. §9c's query depends on the full residual state
+`v_{l-1}` and therefore inherits full content-adaptivity.
+
+### 9c.2 Query parameterisation — per-token, paper-strict (fork decision)
+
+**Locked decision**: **per-token** query, no pooling.
+
+`v_{l-1}` in DAR notation is the residual state *entering* sublayer
+`l` — in our code, this is `x` immediately before the sublayer's
+gated attn/mlp call. Shape: `[B, N, D]`.
+
+The paper writes `q_l(t) = W_q^{(l)} · v_{l-1}` without specifying
+pooling, but two clues point to per-token:
+
+1. Paper §5.1's linear-probe analysis probes "the aggregated hidden
+   state `h_l` that feeds each sublayer's router" for `t` — that
+   phrasing treats the router input as the full `[B, N, D]` tensor.
+2. Paper §D's Triton fused kernel is designed for shape
+   `[N, B, T, D]` (their `T` axis == our token axis `N`), implying
+   per-token queries in the fused implementation.
+
+Concretely for a junction at sublayer `l` with pre-sublayer state
+`x ∈ ℝ^{B×N×D}`:
+
+```
+q_l = self.W_q(x)                          # [B, N, D] -> [B, N, D]
+logits = einsum("bnd, bnld -> bnl", q_l, keys_normed) / sqrt(D)   # scaled
+alpha  = softmax(logits, dim=-1)           # [B, N, l]
+out    = einsum("bnl, bnld -> bnd", alpha, sources)               # [B, N, D]
+```
+
+The mean-pool alternative (`q = W_q(x.mean(dim=1))` → `[B, D]`) was
+considered and rejected as a paper-faithfulness compromise. It reuses
+our existing `q_override_raw` einsum path unchanged but flattens all
+tokens' queries to one per image — a strictly weaker parameterisation
+than the paper's own design. Recorded here for possible ablation.
+
+### 9c.3 Kernel — scaled dot product (`1/√D`)
+
+**Locked decision**: use the paper-standard `1/√D` scaling.
+
+DAR's kernel is the standard scaled dot-product form
+`softmax(q · RMSNorm(k) / √D)`. This is a **third** kernel branch,
+distinct from both E1 (`RMSNorm(q) · RMSNorm(k) / √D`) and E2
+(`q · RMSNorm(k)` un-scaled).
+
+Rationale (paralleling §9a.6 / §9b.4):
+
+- The query `q_l = W_q^{(l)} v_{l-1}` is an upstream matrix-product
+  output, so `‖q‖` can grow unboundedly as `W_q` learns — exactly
+  the pathology that killed E1 before we added `q_rms` (see
+  [TO_FIX.md](TO_FIX.md), "E1 (ARDiTCond) training collapses").
+- But the query is **also** derived from `v_{l-1}`, whose scale is
+  determined by the sum of prior sublayer outputs (each gated by the
+  block's `gate_msa`/`gate_mlp` adaLN-Zero, which start at zero). So
+  the *upstream* scale entering `W_q` is already bounded, unlike E1
+  where `τ` came from a dedicated MLP with no such gating.
+- The paper reports stable training with `1/√D` alone (no query-side
+  RMSNorm) at SiT-XL/2 scale, so we adopt that as the default.
+- If softmax saturation reappears (analogous to the E1 collapse), the
+  §9a fix — adding a `q_rms` on the query path — is available as a
+  safety net. This is recorded as an open question in §14 rather than
+  pre-committing to it.
+
+So the DAR-Dynamic kernel is `ϕ(q, k) = exp(q · RMSNorm(k) / √D)`,
+with `q = W_q^{(l)} v_{l-1}` used **un-normed** (no query-side RMSNorm).
+
+Attention-terminology rule [[memory:j6445n1q]]: as in all our
+variants, the **key** is `k_i = v_i` (raw sublayer output), and
+RMSNorm lives *inside* the kernel — not baked into the key.
+
+### 9c.4 Junction API — new `q_override_pertoken_scaled` branch
+
+Existing `AttnResJunction.forward` branches:
+
+- **v1** (both overrides `None`): `q = self.w` shape `[D]`, kernel
+  `exp(self.w · RMSNorm(k))` (un-scaled, global constant query).
+- **E1** (`q_override` provided): `q` shape `[B, D]`, kernel
+  `exp(RMSNorm(q) · RMSNorm(k) / √D)` (scaled, query-side RMSNorm).
+- **E2** (`q_override_raw` provided): `q` shape `[B, D]`, kernel
+  `exp(q · RMSNorm(k))` (un-scaled, no query-side RMSNorm).
+
+Add a fourth branch:
+
+- **§9c** (`q_override_pertoken_scaled` provided): `q` shape
+  `[B, N, D]`, kernel `exp(q · RMSNorm(k) / √D)` (scaled, no
+  query-side RMSNorm). Logit einsum:
+  `logits = einsum("bnd,bnld->bnl", q, keys_normed) / sqrt(D)`.
+
+Mutual exclusion: at most one of the three overrides may be non-`None`
+per call. This mirrors the existing `q_override` vs `q_override_raw`
+guard and preserves the "one code path per variant, opt in via kwarg"
+pattern.
+
+### 9c.5 Additive bias `self.w` — retained (DDP-safety design decision)
+
+**Locked decision**: `q_l = W_q^{(l)}(v_{l-1}) + w_l`, i.e. keep v1's
+per-junction learnable bias `self.w` and add `W_q^{(l)}(v_{l-1})` to
+it.
+
+This mirrors E1's `q = W_l(τ) + w_l` design (§9a.1) and is a
+deliberate departure from the paper-literal `q = W_q v_{l-1}`. Two
+reasons:
+
+1. **DDP safety.** Our SANA branch crashed on multi-GPU because
+   `attn_res_*.w` was dormant on the `q_override_raw` code path —
+   PyTorch's DDP `find_unused_parameters=False` (the default) requires
+   every parameter to receive gradient. We shipped that branch with
+   `find_unused_parameters=True` in the training config, but the
+   cleaner structural fix is to keep `self.w` on the graph.
+   Folding it in as an additive bias makes `self.w` live on every
+   forward — no dead parameters, no DDP flag needed.
+2. **Superset relationship.** At `W_q^{(l)} = 0` initialisation, the
+   query reduces to `q = w_l`, which is exactly v1. So §9c is a
+   superset of v1: the paper-literal DAR-Dynamic is recovered by
+   fixing `w_l = 0` and freezing it, but we allow the network to
+   *learn* whether the static bias is useful. Since the paper does
+   not ablate this, we adopt the superset as the default.
+
+`self.q_rms` remains dormant on the §9c path (no query-side RMSNorm).
+This is a single unused parameter per junction, not a full parameter
+group — same status as E2 (see §9b.6). No DDP crash from a single
+unused param; the historical crash on SANA was because *all* `self.w`
+were unused, not just `q_rms`. Verified by our SANA training on
+2026-08-13 (commit `6c7b4e2`).
+
+### 9c.6 Initialisation — zero, matches v1 exactly at step 0
+
+**Locked decision**: `W_q^{(l)} = 0` (zero-init) and `w_l = 0` (v1's
+existing init). Then:
+
+- At step 0, `q_l = 0 · v_{l-1} + 0 = 0` for every junction, every
+  image, every timestep.
+- All logits are 0 → `α_{i→l} = 1/l` (uniform mix over the source
+  pool).
+- Residual state entering `FinalLayer` is `v_0 / (2L+1)` (same as v1
+  / E1 / E2 at init).
+- `FinalLayer.linear` is zero-init (baseline DiT convention), so the
+  model output is **bit-exactly zero** — `ARDiTDAR(x, t, y) == 0`
+  for all `x, t, y` at init.
+
+This preserves the strong acceptance criterion from [DiT.md](DiT.md)
+§9.5 across all four variants (v1, E1, E2, §9c). It also means the
+depth mix at init is **uniform and content-agnostic** — with `q ≡ 0`,
+`v_{l-1}` is not consulted, so §9c degenerates to v1 at init
+regardless of `x, t, y`. The content-adaptive `t`-conditioning is
+"switched on" only as `W_q^{(l)}` learns away from zero, under the
+same progressive warm-up as adaLN-Zero itself. This keeps the
+ablation clean: any FID delta §9c-vs-v1 is attributable purely to the
+learned per-image content-adaptive routing, not to an init-time
+perturbation.
+
+### 9c.7 Parameter accounting
+
+New params vs v1 baseline: `2L · D²` (the two `W_q(D, D)` heads per
+block, `bias=False`).
+
+Compared to E1's `2L · D² + D²` (per-junction `W_l` + shared trunk)
+and E2's `2·B_time·D + 2·D` (two codebooks + two biases):
+
+| Variant | New params vs v1 | XL/2 (`L=28`, `D=1152`) |
+|---|---|---|
+| v1 | 0 | 0 |
+| E1 | ~`2L · D²` (dominated by per-junction heads) | ~74.3 M |
+| E2 (`B_time=50`) | `2·B_time·D + 2·D` = `102·D` | ~118 K |
+| §9c DAR-Dynamic | `2L · D²` | ~74.3 M |
+
+§9c and E1 have comparable parameter counts at XL/2 (~74 M). The
+distinction is *how* those parameters are wired: E1 sends
+`t_emb → shared MLP → per-junction linear head → q`, so the query
+depends on `t` only (not on `x`, `y`); §9c sends
+`residual state → per-junction linear head → q`, so the query depends
+on the full `(x, t, y)` context (through the residual state that
+carries all of them). §9c is thus a strict expressiveness superset of
+E1 on the input axis, at matched param count.
+
+### 9c.8 Module API and file layout
+
+```
+models/
+└── ar_dit.py
+    ├── class AttnResJunction(nn.Module)      # (existing) — forward gains
+    │                                          #   q_override_pertoken_scaled kwarg
+    ├── class ARDiTDARBlock(nn.Module)         # NEW — §9c block, owns
+    │                                          #   W_q_msa, W_q_mlp
+    ├── class ARDiTDAR(nn.Module)              # NEW — §9c end-to-end model
+    └── presets ARDiTDAR_{S,B,L,XL}_2          # NEW — 4 sizes,
+                                               #   mirror ARDiT_{S,B,L,XL}_2
+```
+
+- `ARDiTDARBlock.__init__` adds two `nn.Linear(D, D, bias=False)` heads
+  (`W_q_msa`, `W_q_mlp`), zero-init in `ARDiTDAR._init_weights`.
+- `ARDiTDARBlock.forward(x, c, cache)` mirrors `ARDiTBlock.forward`
+  exactly, except:
+  - Before the MSA junction call: `q_msa = self.W_q_msa(x) + self.attn_res_msa.w`
+    (shape `[B, N, D]`), passed as `q_override_pertoken_scaled`.
+  - Before the MLP junction call: `q_mlp = self.W_q_mlp(x) + self.attn_res_mlp.w`
+    (shape `[B, N, D]`), passed as `q_override_pertoken_scaled`.
+  - Note `x` at each call is the residual state *entering* that
+    sublayer — this is `v_{l-1}` in DAR notation. For MSA it's
+    the block input `h_{2b}`; for MLP it's `h_{2b+1}` (the output
+    of the MSA junction).
+- No outer-model shared query module (unlike E1's `TimeQueryTrunk`
+  or E2's `SANATimeCondQuery`): §9c's queries are fully local to each
+  block, so `ARDiTDAR.forward` is structurally identical to
+  `ARDiT.forward` — same patch/pos-embed prelude, same block loop
+  (blocks are just `ARDiTDARBlock` instead of `ARDiTBlock`), same
+  `FinalLayer`.
+- Config: no new fields needed. `ARDiTDAR` presets take exactly the
+  same kwargs as `ARDiT` presets.
+- Registration in `models/__init__.py`: four new entries in
+  `_ARCH_PRESETS` (`ARDiTDAR_S_2`, `_B_2`, `_L_2`, `_XL_2`). No
+  entries in `_ARCHES_WITH_TIME_BINS` (§9c has no discrete-time
+  codebook).
+- Training: two new grad-norm groups in `utils/grad_norm.py` —
+  `blocks.W_q_msa`, `blocks.W_q_mlp` — let the optimiser's RMSNorm-
+  style diagnostics track whether the query heads drift during
+  training. This is the same monitoring pattern that caught the E1
+  collapse (see [TO_FIX.md](TO_FIX.md)).
+
+Selection between v1 / E1 / E2 / §9c is **purely** via config + the
+model registry.
+
+### 9c.9 Test plan (§9c-specific)
+
+Mirrors §9a.7 / §9b.7:
+
+| Test (in `tests/test_ar_dit.py`) | Assertion | Why it's the smoking gun |
+|---|---|---|
+| `test_ardit_dar_forward_shape_and_dtype` | `ARDiTDAR(x, t, y)` is `[B, C, H, W]`, same dtype as `x`. | API parity with v1 / E1 / E2. |
+| `test_ardit_dar_zero_init_output_is_zero` | `torch.equal(ARDiTDAR(x, t, y), zeros_like(...))` at init, for several `t`. | Zero-init invariant holds across `t`. |
+| `test_ardit_dar_zero_init_uniform_mix` | Hook `FinalLayer` input at init; assert `= v_0 / (2L+1)` for `t = 0.01` **and** `t = 0.99`. | Depth mix uniform **and content-invariant** at init (queries all zero). |
+| `test_ardit_dar_param_count_diff` | Exact analytical diff vs baseline `ARDiT` `= 2L · D²`. | Confirms `W_q_msa`, `W_q_mlp` shapes; catches accidental bias. |
+| `test_ardit_dar_content_dependence` | After perturbing the last block's `W_q_mlp` and `FinalLayer.linear`, changing **any of** `x`, `t`, `y` alone changes output by `> 1e-2`. | §9c depends on full `(x, t, y)` via the AttnRes path, not just adaLN-Zero. Distinguishes §9c from E1 (which only responds to `t`) and E2 (which only responds to `bin(t)`). |
+| `test_ardit_dar_grad_flow` | Forward + MSE + backward at init; every §9c param has `grad is not None and isfinite`. Assert `q_rms.grad is None` (§9c bypasses it). | Modules on the backward graph, dormant param invariant preserved. |
+| `test_ardit_dar_smoke_roundtrip` | Forward + MSE loss + backward; no NaN, all trainable params receive gradient (except `q_rms` — see above). | End-to-end sanity. |
+
+Provisional-test caveat from §9a still applies.
+
+### 9c.10 Implementation order (once resumed)
+
+Suggested commit sequence on `feature/dar-architecture`, mirroring how
+E1 / E2 shipped:
+
+1. `feat(§9c): add q_override_pertoken_scaled branch to AttnResJunction`
+   — one new branch in the `if/elif` cascade, one shape assertion,
+   one new einsum. Extend the module docstring's `q_override` /
+   `q_override_raw` narrative to cover the third path.
+2. `feat(§9c): add ARDiTDARBlock and ARDiTDAR + presets`
+   — new block class, new outer model, four preset factories, zero-
+   init discipline for `W_q_msa`/`W_q_mlp` in `_init_weights`.
+3. `feat(§9c): register ARDiTDAR presets in model registry`
+   — add entries to `_ARCH_PRESETS`; no `_ARCHES_WITH_TIME_BINS`
+   entry needed.
+4. `feat(§9c): grad-norm groups for W_q heads`
+   — add regex groups for `blocks.W_q_msa` and `blocks.W_q_mlp` in
+   `utils/grad_norm.py`.
+5. `feat(§9c): tests for ARDiTDAR` — the seven tests in §9c.9.
+6. `feat(§9c): configs — ar_dit_dar_s2_cifar.yaml and
+   cifar10_ar_dit_dar_s2_train.yaml` (mirror E1 / E2 pattern).
+
+Each commit independently runnable and reviewable, per project
+convention.
+
+### 9c.11 Deliberate simplifications vs the paper
+
+Recorded here so nothing gets accidentally "fixed" back to
+paper-literal later:
+
+1. **No chunking.** Paper §4.2 chunks the source pool for memory
+   (optimal `S=4`). We follow this project's convention of full-
+   history weighted-sum (same as v1 / E1 / E2). Consequence: source-
+   cache memory is `O(L·d)` per rank, same as v1 — see §13. At XL/2
+   with `L=56` sublayers, this is a known constraint (gradient
+   checkpointing may be needed, per §14 Q1); not a §9c-specific
+   issue.
+2. **No dedicated final aggregator.** Paper §C.2 uses a special
+   final-layer aggregator over `{summaries} ∪ {last-chunk v's}`.
+   Since we skip chunking, "summaries" don't exist; we use the
+   standard `FinalLayer` on `h_{2L}`, same as v1 / E1 / E2.
+3. **No Triton fused kernel.** Paper §D provides a fused CUDA kernel
+   with online softmax (11.5× forward / 8.5× backward speedup). We
+   use the naive `einsum`-based reference implementation, same
+   discipline as v1 / E1 / E2. A fused kernel is a separate infra
+   project that can be added later without changing the model
+   definition.
+4. **Additive bias `w_l` retained.** Paper writes
+   `q = W_q v_{l-1}`; we write `q = W_q v_{l-1} + w_l` for DDP safety
+   and to make §9c a strict superset of v1 (§9c.5). At `W_q = 0`
+   init both are equivalent up to the value of `w_l` (also zero at
+   init), so this does not affect the paper's zero-init story.
+
+None of these deviate from the paper's core thesis — "learnable,
+timestep-adaptive, non-incremental aggregation via a content-adaptive
+query" — they're all engineering-side simplifications.
+
+---
+
 ## 10. Initialisation
 
 **Locked decision**: `w_l = 0` for all `l`, `g_l = 1` for all RMSNorms.
@@ -1074,6 +1436,26 @@ the training loop.
    (e.g. "attention to shallow layers dominates for background patches,
    deep layers for foreground")? If yes, that's a nice qualitative
    result independent of FID gains.
+4. **§9c-specific — per-token vs mean-pooled query.** We locked
+   per-token (§9c.2) as the paper-faithful choice, but mean-pooled
+   (`q = W_q(v_{l-1}.mean(dim=1))`, `[B, D]`) is `1/N`× cheaper in
+   FLOPs and reuses the existing `q_override_raw` einsum path. Worth
+   an ablation if per-token proves prohibitively expensive at XL/2 +
+   32×32 latent scale.
+5. **§9c-specific — kernel safety net.** §9c uses
+   `exp(q · RMSNorm(k) / √D)` with `q = W_q v_{l-1}` un-normed
+   (§9c.3). This is paper-standard but leaves open the question of
+   whether the E1-style collapse (unbounded `‖W_q‖` → softmax
+   saturation → dead upstream gradients, [TO_FIX.md](TO_FIX.md)) can
+   recur. The gating on `v_{l-1}` (its scale is controlled by adaLN-
+   Zero gates and the softmax normalisation of prior junctions)
+   should provide implicit bounding, but this is not proven — needs
+   live monitoring on the grad-norm groups from §9c.8.
+6. **§9c-specific — is the `w_l` bias earning its keep?** §9c.5 keeps
+   `w_l` as an additive bias mostly for DDP safety. Once training is
+   stable, worth checking whether `‖w_l‖` grows away from zero, or
+   stays near-zero (in which case the bias is essentially dead code
+   and could be removed for a cleaner paper-literal implementation).
 
 ---
 
@@ -1084,3 +1466,6 @@ the training loop.
   ICCV 2023.
 - Zhang & Sennrich, *Root Mean Square Layer Normalization*,
   NeurIPS 2019.
+- Xu, Li, Li, et al., *Rethinking Cross-Layer Information Routing in
+  Diffusion Transformers* (DAR), arXiv:2605.20708, 2026 — source of
+  §9c's dynamic query parameterisation.
